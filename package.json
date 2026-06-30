@@ -1,0 +1,63 @@
+{
+  "name": "void-scraper",
+  "version": "1.0.0",
+  "description": "A premium, dynamic web scraper application built with Electron.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "build:portable": "electron-builder --win portable"
+  },
+  "keywords": [
+    "electron",
+    "scraper",
+    "dynamic",
+    "glassmorphism"
+  ],
+  "author": "Antigravity",
+  "license": "ISC",
+  "build": {
+    "appId": "com.void.streamer",
+    "productName": "Void Streamer",
+    "icon": "icon.png",
+    "files": [
+      "main.js",
+      "preload.js",
+      "scraper.js",
+      "index.html",
+      "style.css",
+      "renderer.js",
+      "icon.png",
+      "25.gif"
+    ],
+    "win": {
+      "icon": "icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "cheerio": "^1.0.0-rc.12"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^26.15.3"
+  }
+}
