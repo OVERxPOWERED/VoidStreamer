@@ -4,8 +4,10 @@ A premium Electron desktop application for streaming movies, TV shows, and anime
 
 ## Features
 
-- **Multi-source streaming** — StreameX, Moviepire, LunaStream, DuloTV, LordFlix, RiveStream, 7REELS, YouFlex, Screenscape
-- **Anime support** — Anikoto, LunaAnime, AnimeX, AniLight with dedicated anime section
+- **Multi-source streaming**
+
+- **Anime support**  with dedicated anime section
+
 - **TMDB-powered** — Popular listings, search, cast info, recommendations
 - **Built-in video cache** — Cache direct video files locally for smoother playback
 - **Video-on-click download** — Persistent downloads with real-time progress
