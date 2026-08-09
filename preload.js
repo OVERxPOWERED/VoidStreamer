@@ -18,8 +18,15 @@ contextBridge.exposeInMainWorld('api', {
   onDownloadStarted:  (cb) => ipcRenderer.on('download-started',  (e, d) => cb(d)),
   onDownloadProgress: (cb) => ipcRenderer.on('download-progress', (e, d) => cb(d)),
   onDownloadDone:     (cb) => ipcRenderer.on('download-done',     (e, d) => cb(d)),
-  cacheVideo:          (url, title)   => ipcRenderer.invoke('cache-video', { url, title }),
+  cacheVideo:          (url, title, cacheId) => ipcRenderer.invoke('cache-video', { url, title, cacheId }),
+  listCache:           ()             => ipcRenderer.invoke('list-cache'),
+  saveCache:           (cachePath)    => ipcRenderer.invoke('save-cache', { cachePath }),
+  deleteCache:         (cachePath)    => ipcRenderer.invoke('delete-cache', { cachePath }),
+  listActiveCaches:    ()             => ipcRenderer.invoke('list-active-caches'),
+  cancelCache:         (cacheId)      => ipcRenderer.invoke('cancel-cache', { cacheId }),
+  onCacheStarted:      (cb)           => { const fn = (e, d) => cb(d); ipcRenderer.on('cache-started', fn); return () => ipcRenderer.removeListener('cache-started', fn); },
   onCacheProgress:     (cb)           => { const fn = (e, d) => cb(d); ipcRenderer.on('cache-progress', fn); return () => ipcRenderer.removeListener('cache-progress', fn); },
+  onCacheDone:         (cb)           => { const fn = (e, d) => cb(d); ipcRenderer.on('cache-done', fn); return () => ipcRenderer.removeListener('cache-done', fn); },
   removeDownloadListeners: () => {
     ipcRenderer.removeAllListeners('download-started');
     ipcRenderer.removeAllListeners('download-progress');

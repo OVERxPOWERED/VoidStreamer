@@ -63,7 +63,7 @@ const DEFAULT_SOURCES = [
 ];
 
 const STREAM_EMBEDS = ['play.xpass.top', 'vidcore.net', 'vsembed.ru', 'player.videasy.net', 'zxcstream.xyz', 'vidplays.fun', 'player.vidplus.to', 'vidlink.pro', 'vidsrc.mov', 'vidrock.net', 'vidnest.fun', 'vidup.to', 'player.vidify.top', 'player.vidzee.wtf', 'strigil.cc', 'rivestream.app', '7reels.cc', 'youflex.top', 'screenscape.me'];
-const STORAGE_KEYS = { sources: 'vs_sources', downloads: 'vs_downloads' };
+const STORAGE_KEYS = { sources: 'vs_sources', downloads: 'vs_downloads', cacheEnabled: 'vs_cache_enabled' };
 
 let _ffmpegInstance = null;
 
@@ -178,7 +178,22 @@ function createVirtualGrid(container, opts = {}) {
     if (!ticking) { requestAnimationFrame(render); ticking = true; }
   }
 
-  function init() {
+function initCacheListeners() {
+  window.api.onCacheStarted((d) => { upsertActiveCache(d); renderCachedDownloads(); });
+  window.api.onCacheProgress((d) => {
+    if (d.cacheId && state.activeCaches.some(a => a.cacheId === d.cacheId)) {
+      upsertActiveCache(d);
+      updateActiveCacheItem(d.cacheId, d.percent || 0, d.received || 0);
+    }
+  });
+  window.api.onCacheDone((d) => {
+    state.activeCaches = state.activeCaches.filter(a => a.cacheId !== d.cacheId);
+    if (d && d.success) loadCachedDownloads();
+    else renderCachedDownloads();
+  });
+}
+
+function init() {
     container.innerHTML = '';
     container.style.overflowY = 'auto';
     container.style.position = 'relative';
@@ -229,8 +244,8 @@ function createVirtualGrid(container, opts = {}) {
 
 let state = {
   sources: [], currentSection: 'home', navStack: [], currentMovie: null, currentSource: null,
-  currentDownloads: [], savedDownloads: [], heroItems: [], heroIndex: 0, heroInterval: null,
-  searchTimeout: null, animeLang: 'sub'
+  currentDownloads: [], savedDownloads: [], cachedDownloads: [], activeCaches: [], heroItems: [], heroIndex: 0, heroInterval: null,
+  searchTimeout: null, animeLang: 'sub', cacheEnabled: true
 };
 
 function normalizeTitle(t) { return (t||'').toLowerCase().replace(/[^a-z0-9]/g,''); }
@@ -282,6 +297,15 @@ function loadSavedDownloads() {
   catch { state.savedDownloads = []; }
 }
 function saveSavedDownloads() { localStorage.setItem(STORAGE_KEYS.downloads, JSON.stringify(state.savedDownloads)); }
+function loadCacheEnabled() {
+  try {
+    const v = localStorage.getItem(STORAGE_KEYS.cacheEnabled);
+    state.cacheEnabled = v === null ? true : v === '1';
+  } catch { state.cacheEnabled = true; }
+}
+function saveCacheEnabled() {
+  localStorage.setItem(STORAGE_KEYS.cacheEnabled, state.cacheEnabled ? '1' : '0');
+}
 function hideSuggestions() { const b = $('#search-suggestions'); if (b) b.classList.add('hidden'); }
 
 function formatQualityLabel(item) {
@@ -318,7 +342,7 @@ function showSection(name, skipLoad) {
   if (name === 'movies') loadSectionGrid('movies');
   if (name === 'tv') loadSectionGrid('tv');
   if (name === 'anime') loadSectionGrid('anime');
-  if (name === 'downloads') renderDownloads();
+  if (name === 'downloads') { loadCachedDownloads(); loadActiveCaches(); renderDownloads(); }
 }
 function pushNav() { state.navStack.push(state.currentSection); }
 function popNav() {
@@ -1041,6 +1065,7 @@ function initCustomControls() {
   const skipForwardBtn = document.getElementById('skipForwardBtn');
   const pipBtn = document.getElementById('pipBtn');
   const fullscreenBtn = document.getElementById('fullscreenBtn');
+  const cacheBtn = document.getElementById('cacheBtn');
   if (!video) return;
 
   function fmt(seconds) {
@@ -1121,6 +1146,24 @@ function initCustomControls() {
     } else if (video.requestPictureInPicture) {
       video.requestPictureInPicture();
     }
+  });
+
+  // Save-for-offline: start caching the current video manually
+  cacheBtn.addEventListener('click', () => {
+    if (!_currentPlayingUrl) return;
+    if (isHlsUrl(_currentPlayingUrl)) {
+      showToast('HLS streams cannot be saved for offline');
+      return;
+    }
+    if (isLocalServerUrl(_currentPlayingUrl)) {
+      showToast('This video is already available offline');
+      return;
+    }
+    if (_cachingUrl === _currentPlayingUrl) {
+      showToast('Already caching this video');
+      return;
+    }
+    startBackgroundCache(_currentPlayingUrl, _currentPlayingTitle);
   });
 
   // Fullscreen
@@ -1211,6 +1254,8 @@ const MIME_MAP = {
 
 async function loadStream(video, url, title) {
   if (_hlsInstance) { _hlsInstance.destroy(); _hlsInstance = null; }
+  _currentPlayingUrl = url;
+  _currentPlayingTitle = title || '';
   video.removeAttribute('src');
   video.innerHTML = '';
 
@@ -1225,49 +1270,11 @@ async function loadStream(video, url, title) {
     return;
   }
 
-  let playUrl = url;
+  // Direct media: start playback immediately from the source,
+  // and cache the file in the background for offline saving.
+  const playUrl = url;
   if (url.startsWith('http://') || url.startsWith('https://')) {
-    try {
-      const loadingOverlay = $('#video-loading-overlay');
-      let progBar = document.getElementById('cache-progress-bar');
-      if (!progBar) {
-        progBar = document.createElement('div');
-        progBar.id = 'cache-progress-bar';
-        progBar.style.cssText = 'width:80%;max-width:400px;height:6px;background:#333;border-radius:3px;margin:16px auto 0;overflow:hidden';
-        const fill = document.createElement('div');
-        fill.id = 'cache-progress-fill';
-        fill.style.cssText = 'height:100%;width:0%;background:var(--accent,#6c5ce7);border-radius:3px;transition:width .3s';
-        progBar.appendChild(fill);
-      }
-      let progText = loadingOverlay?.querySelector('.cache-progress-text');
-      if (!progText) {
-        progText = document.createElement('p');
-        progText.className = 'cache-progress-text';
-        progText.style.cssText = 'margin-top:12px;font-size:13px;color:var(--text-muted,#999)';
-      }
-      if (loadingOverlay && !progBar.parentNode) loadingOverlay.appendChild(progBar);
-      if (loadingOverlay && !progText.parentNode) loadingOverlay.appendChild(progText);
-
-      const fill = progBar.querySelector('#cache-progress-fill');
-      if (progText) progText.textContent = 'Caching video...';
-      if (fill) fill.style.width = '0%';
-
-      const unsub = window.api.onCacheProgress(({ percent }) => {
-        if (fill) fill.style.width = Math.min(percent, 100) + '%';
-        if (progText) progText.textContent = `Caching video... ${Math.min(percent, 100)}%`;
-      });
-
-      const result = await window.api.cacheVideo(url, title || '');
-      unsub();
-      if (result.success && result.path) {
-        playUrl = 'file:///' + result.path.replace(/\\/g, '/').replace(/ /g, '%20');
-        console.log('[player] playing from cache:', playUrl);
-      }
-      if (progText) progText.textContent = '';
-      if (progBar.parentNode) progBar.remove();
-    } catch (e) {
-      console.warn('[player] cache failed, playing original URL:', e.message);
-    }
+    if (!isLocalServerUrl(url) && state.cacheEnabled) startBackgroundCache(url, _currentPlayingTitle);
   }
 
   const ext = getExt(playUrl);
@@ -1278,6 +1285,93 @@ async function loadStream(video, url, title) {
   video.appendChild(source);
   video.load();
   video.play().catch(() => {});
+}
+
+function isLocalServerUrl(url) {
+  return url.includes('127.0.0.1') || url.includes('localhost');
+}
+
+let _activeCacheUnsub = null;
+let _currentPlayingUrl = null;
+let _currentPlayingTitle = '';
+let _cachingUrl = null;
+let _cachingPercent = 0;
+
+function getCacheBadge() {
+  return $('#cache-badge');
+}
+
+function showToast(msg) {
+  let t = $('#toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._toastTimer);
+  t._toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+// Reflect the current cache state on the player's Save button.
+function updateCacheButton() {
+  const btn = $('#cacheBtn');
+  if (!btn) return;
+  btn.classList.remove('caching', 'cached');
+  if (_cachingUrl) {
+    btn.classList.add('caching');
+    btn.title = _cachingPercent >= 100 ? 'Cached — save it offline in Downloads > Cached' : `Caching... ${_cachingPercent}%`;
+  } else if (_currentPlayingUrl && isLocalServerUrl(_currentPlayingUrl)) {
+    btn.classList.add('cached');
+    btn.title = 'Already saved for offline';
+  } else {
+    btn.title = state.cacheEnabled ? 'Caching automatically — tap to start over' : 'Save for offline';
+  }
+}
+
+// Start caching a video in the background while the player keeps playing.
+function startBackgroundCache(url, title) {
+  if (_cachingUrl === url) return;
+  if (isLocalServerUrl(url)) return;
+  const badge = getCacheBadge();
+  const myId = `cache_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  _cachingUrl = url;
+  _cachingPercent = 0;
+  if (_activeCacheUnsub) { _activeCacheUnsub(); _activeCacheUnsub = null; }
+  if (badge) { badge.textContent = 'Caching...'; badge.classList.remove('hidden'); }
+  updateCacheButton();
+
+  const unsub = window.api.onCacheProgress(({ cacheId, percent }) => {
+    if (cacheId && cacheId !== myId) return;
+    _cachingPercent = Math.min(percent, 100);
+    if (badge) badge.textContent = `Caching... ${_cachingPercent}%`;
+    updateCacheButton();
+  });
+  _activeCacheUnsub = unsub;
+
+  window.api.cacheVideo(url, title || '', myId).then((result) => {
+    try { if (unsub) unsub(); } catch {}
+    _activeCacheUnsub = null;
+    _cachingUrl = null;
+    _cachingPercent = 0;
+    if (badge) badge.classList.add('hidden');
+    updateCacheButton();
+    if (result && result.success && result.path) {
+      loadCachedDownloads();
+      showToast('Cached — save it offline in Downloads > Cached');
+    } else {
+      console.warn('[cache] background cache failed:', result && result.error);
+    }
+  }).catch((e) => {
+    try { if (unsub) unsub(); } catch {}
+    _activeCacheUnsub = null;
+    _cachingUrl = null;
+    _cachingPercent = 0;
+    if (badge) badge.classList.add('hidden');
+    updateCacheButton();
+    console.warn('[cache] background cache error:', e.message);
+  });
 }
 
 async function playVideo(url, title, lang) {
@@ -1633,6 +1727,151 @@ function renderCompletedDownloads() {
   }));
 }
 
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+async function loadCachedDownloads() {
+  try {
+    const result = await window.api.listCache();
+    state.cachedDownloads = result.success ? (result.items || []) : [];
+  } catch {
+    state.cachedDownloads = [];
+  }
+  renderCachedDownloads();
+}
+
+async function loadActiveCaches() {
+  try {
+    const result = await window.api.listActiveCaches();
+    state.activeCaches = result.success ? (result.caches || []) : [];
+  } catch {
+    state.activeCaches = [];
+  }
+  renderCachedDownloads();
+}
+
+function upsertActiveCache(data) {
+  if (!data || !data.cacheId) return;
+  const existing = state.activeCaches.find(a => a.cacheId === data.cacheId);
+  if (existing) Object.assign(existing, data);
+  else state.activeCaches.push({ cacheId: data.cacheId, ...data });
+}
+
+function updateActiveCacheItem(cacheId, percent, received) {
+  const row = document.querySelector(`#dl-caching-list [data-cid="${cacheId}"]`);
+  if (!row) return;
+  const meta = row.querySelector('.saved-dl-meta');
+  if (meta) meta.textContent = `Caching ${percent}% · ${formatBytes(received)}`;
+  const fill = row.querySelector('.cache-progress-fill');
+  if (fill) fill.style.width = `${Math.min(percent, 100)}%`;
+}
+
+function renderCachedDownloads() {
+  const listEl = $('#dl-cached-list');
+  const cacheListEl = $('#dl-caching-list');
+  const emptyEl = $('#dl-cached-empty');
+  const countEl = $('#dl-cached-count');
+  if (countEl) countEl.textContent = state.cachedDownloads.length;
+  const hasActive = state.activeCaches.length > 0;
+
+  if (cacheListEl) {
+    cacheListEl.innerHTML = state.activeCaches.map(c => `
+      <div class="saved-dl-item" data-cid="${c.cacheId}">
+        <div class="saved-dl-poster">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="20" height="20"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        </div>
+        <div class="saved-dl-info">
+          <div class="saved-dl-title">${escapeHtml(c.title || c.filename || 'Caching video...')}</div>
+          <div class="saved-dl-meta">Caching ${Math.min(c.percent || 0, 100)}% · ${formatBytes(c.received || 0)}</div>
+          <div class="cache-progress-track"><div class="cache-progress-fill" style="width:${Math.min(c.percent || 0, 100)}%"></div></div>
+        </div>
+        <div class="saved-dl-actions">
+          <button class="download-btn danger cancel-cache" data-cid="${c.cacheId}">Cancel</button>
+        </div>
+      </div>`).join('');
+
+    $$('.cancel-cache', cacheListEl).forEach(b => b.addEventListener('click', async () => {
+      const cid = b.dataset.cid;
+      await window.api.cancelCache(cid);
+      state.activeCaches = state.activeCaches.filter(a => a.cacheId !== cid);
+      renderCachedDownloads();
+    }));
+  }
+
+  if (!listEl) return;
+  if (!state.cachedDownloads.length) {
+    listEl.innerHTML = '';
+    if (emptyEl) emptyEl.classList.toggle('hidden', hasActive);
+    return;
+  }
+  if (emptyEl) emptyEl.classList.add('hidden');
+
+  listEl.innerHTML = state.cachedDownloads.map((c, i) => `
+    <div class="saved-dl-item">
+      <div class="saved-dl-poster">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="20" height="20"><path d="M19 8H5v12h14V8zm0-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm-7 12V6"/></svg>
+      </div>
+      <div class="saved-dl-info">
+        <div class="saved-dl-title">${escapeHtml(c.name)}</div>
+        <div class="saved-dl-meta">${c.size > 0 ? formatBytes(c.size) : 'Unknown size'} · Cached</div>
+      </div>
+      <div class="saved-dl-actions">
+        <button class="download-btn primary play-cache" data-idx="${i}">Play</button>
+        <button class="download-btn secondary save-cache" data-idx="${i}">Save</button>
+        <button class="download-btn danger delete-cache" data-idx="${i}">Delete</button>
+      </div>
+    </div>`).join('');
+
+  $$('.play-cache', listEl).forEach(b => b.addEventListener('click', async () => {
+    const c = state.cachedDownloads[parseInt(b.dataset.idx)];
+    if (!c) return;
+    const result = await window.api.playLocalFile(c.path);
+    if (result.success && result.url) {
+      playVideo(result.url, c.name);
+    } else {
+      showToast('Cannot play this cached file');
+    }
+  }));
+
+  $$('.save-cache', listEl).forEach(b => b.addEventListener('click', async () => {
+    const c = state.cachedDownloads[parseInt(b.dataset.idx)];
+    if (!c) return;
+    b.disabled = true;
+    b.textContent = 'Saving...';
+    const result = await window.api.saveCache(c.path);
+    b.disabled = false;
+    b.textContent = 'Save';
+    if (result.success) {
+      state.savedDownloads.unshift({
+        title: result.filename || c.name,
+        quality: 'Cached',
+        image: '',
+        path: result.path
+      });
+      saveSavedDownloads();
+      renderCompletedDownloads();
+      showToast('Saved to Downloads/Void Streamer');
+    } else {
+      showToast('Save failed: ' + (result.error || 'Unknown error'));
+    }
+  }));
+
+  $$('.delete-cache', listEl).forEach(b => b.addEventListener('click', async () => {
+    const c = state.cachedDownloads[parseInt(b.dataset.idx)];
+    if (!c) return;
+    const result = await window.api.deleteCache(c.path);
+    if (result.success) {
+      state.cachedDownloads.splice(parseInt(b.dataset.idx), 1);
+      renderCachedDownloads();
+    } else {
+      showToast('Delete failed: ' + (result.error || 'Unknown error'));
+    }
+  }));
+}
+
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
   const k = 1024;
@@ -1648,6 +1887,7 @@ function formatSpeed(bytesPerSec) {
 function renderDownloads() {
   renderActiveDownloads();
   renderCompletedDownloads();
+  renderCachedDownloads();
 }
 
 function initDownloadListeners() {
@@ -1715,12 +1955,19 @@ function initDownloadTabs() {
       const target = tab.dataset.tab;
       const activeContent = $('#dl-tab-active');
       const completedContent = $('#dl-tab-completed');
+      const cachedContent = $('#dl-tab-cached');
       if (target === 'active') {
         if (activeContent) activeContent.classList.remove('hidden');
         if (completedContent) completedContent.classList.add('hidden');
-      } else {
+        if (cachedContent) cachedContent.classList.add('hidden');
+      } else if (target === 'completed') {
         if (activeContent) activeContent.classList.add('hidden');
         if (completedContent) completedContent.classList.remove('hidden');
+        if (cachedContent) cachedContent.classList.add('hidden');
+      } else {
+        if (activeContent) activeContent.classList.add('hidden');
+        if (completedContent) completedContent.classList.add('hidden');
+        if (cachedContent) cachedContent.classList.remove('hidden');
       }
     });
   });
@@ -1821,10 +2068,23 @@ function initEventListeners() {
 function init() {
   loadSources();
   loadSavedDownloads();
+  loadCacheEnabled();
   initEventListeners();
   initDownloadListeners();
   initDownloadTabs();
   populateSourceFilter();
+  initCacheListeners();
+  loadCachedDownloads();
+  loadActiveCaches();
+  const cacheToggle = $('#cache-enabled-toggle');
+  if (cacheToggle) {
+    cacheToggle.checked = state.cacheEnabled;
+    cacheToggle.addEventListener('change', () => {
+      state.cacheEnabled = cacheToggle.checked;
+      saveCacheEnabled();
+      showToast(state.cacheEnabled ? 'Auto-cache enabled' : 'Auto-cache disabled');
+    });
+  }
   showSection('home');
 }
 
