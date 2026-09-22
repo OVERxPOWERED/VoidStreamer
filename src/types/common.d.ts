@@ -1,4 +1,3 @@
-// Shared TypeScript definitions
 export type Nullable<T> = T | null | undefined;
 export type AsyncResult<T> = Promise<{ data?: T; error?: Error }>;
 export interface BaseEntity {
@@ -6,5 +5,3 @@ export interface BaseEntity {
   createdAt: Date;
   updatedAt: Date;
 }
-
-// Revision 32 - 2026-09-21
