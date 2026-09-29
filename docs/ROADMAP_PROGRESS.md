@@ -10,11 +10,11 @@
 
 ## Milestone 2: Service Layer & Business Logic
 - [x] Implement domain service handlers and business logic
-- [ ] Add input sanitization and secure parameter validation
+- [x] Add input sanitization and secure parameter validation
 - [ ] Configure structured telemetry and error event handling
 
 ## Milestone 3: Endpoints & Application Integration
-- [x] Implement service API endpoints with schema validation
+- [ ] Implement service API endpoints with schema validation
 - [ ] Add query caching layer and data access optimization
 - [ ] Configure system health checks and status diagnostics
 
@@ -30,3 +30,4 @@
 
 ## Checkpoint History
 - **2026-09-29**: Initialized roadmap progress tracker with active project milestones.
+- **2026-09-29**: Completed domain service layer with StreamerService, validation utilities, and unit test coverage [checkpoint #4]
