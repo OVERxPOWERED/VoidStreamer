@@ -109,11 +109,7 @@ function validatePagination(page, limit) {
     throw new ValidationError('Limit must be an integer between 1 and 100', 'INVALID_LIMIT');
   }
 
-  return {
-    page: parsedPage,
-    limit: parsedLimit,
-    offset: (parsedPage - 1) * parsedLimit
-  };
+  return { page: parsedPage, limit: parsedLimit };
 }
 
 module.exports = {
