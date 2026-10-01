@@ -1,3 +1,6 @@
+```javascript
+const cheerio = require('cheerio');
+
 class ValidationError extends Error {
   constructor(message, code) {
     super(message);
@@ -11,6 +14,7 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const NUMERIC_ID_REGEX = /^\d+$/;
 const HTML_TAG_REGEX = /<[^>]*>/g;
 const SPECIAL_CHARS_REGEX = /[<>&"']/g;
+const URL_REGEX = /^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$/;
 
 const HTML_ESCAPE_MAP = {
   '<': '&lt;',
@@ -36,6 +40,14 @@ function sanitizeString(input, maxLength = 256) {
   }
 
   return sanitized;
+}
+
+function sanitizeHtml(input) {
+  if (typeof input !== 'string') {
+    return '';
+  }
+  const $ = cheerio.load(input, { decodeEntities: false });
+  return $.text().trim();
 }
 
 function validateStreamerId(id) {
@@ -112,10 +124,71 @@ function validatePagination(page, limit) {
   return { page: parsedPage, limit: parsedLimit };
 }
 
-module.exports = {
-  ValidationError,
-  sanitizeString,
-  validateStreamerId,
-  validateSessionParams,
-  validatePagination
-};
+function createSchemaBuilder(schemaDefinition) {
+  const validators = schemaDefinition;
+
+  function parse(data) {
+    const result = safeParse(data);
+    if (!result.success) {
+      const error = new ValidationError(result.errors.join('; '), 'VALIDATION_FAILED');
+      error.errors = result.errors;
+      throw error;
+    }
+    return result.data;
+  }
+
+  function safeParse(data) {
+    const errors = [];
+    const result = {};
+
+    for (const [key, validator] of Object.entries(validators)) {
+      const value = data[key];
+      try {
+        result[key] = validator(value, data);
+      } catch (err) {
+        if (err instanceof ValidationError) {
+          errors.push(`${key}: ${err.message}`);
+        } else {
+          errors.push(`${key}: ${err.message}`);
+        }
+      }
+    }
+
+    if (errors.length > 0) {
+      return { success: false, errors };
+    }
+    return { success: true, data: result };
+  }
+
+  function validate(data) {
+    const result = safeParse(data);
+    return {
+      success: result.success,
+      data: result.data,
+      errors: result.errors
+    };
+  }
+
+  return { parse, safeParse, validate };
+}
+
+function createStreamSchema() {
+  return createSchemaBuilder({
+    id: (value) => {
+      if (!value) throw new ValidationError('Stream ID is required', 'MISSING_ID');
+      const idStr = String(value).trim();
+      if (!idStr) throw new ValidationError('Stream ID cannot be empty', 'EMPTY_ID');
+      if (!UUID_REGEX.test(idStr) && !NUMERIC_ID_REGEX.test(idStr)) {
+        throw new ValidationError('Stream ID must be a valid UUID or numeric ID', 'INVALID_ID_FORMAT');
+      }
+      return idStr;
+    },
+    streamerId: (value) => {
+      if (!value) throw new ValidationError('Streamer ID is required', 'MISSING_STREAMER_ID');
+      return validateStreamerId(value);
+    },
+    title: (value) => {
+      if (!value) throw new ValidationError('Title is required', 'MISSING_TITLE');
+      const sanitized = sanitizeHtml(String(value));
+      if (sanitized.length > 200) {
+        throw new ValidationError('Title must not exceed 200 characters', 'TITLE_TOO_LONG');
