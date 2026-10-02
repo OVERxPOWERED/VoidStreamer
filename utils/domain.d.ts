@@ -1,39 +1,60 @@
-import { BaseEntity, Nullable } from './common.d.ts';
+import { BaseEntity } from './common.d.ts';
 
-export enum StreamPlatform {
-  TWITCH = 'TWITCH',
-  YOUTUBE = 'YOUTUBE',
-  KICK = 'KICK',
-  TROVO = 'TROVO'
-}
-
-export type StreamQuality = '1080p' | '720p' | '480p' | '360p' | 'audio_only';
-
-export interface StreamEntity extends BaseEntity {
+export interface Stream extends BaseEntity {
   id: string;
   title: string;
   url: string;
-  thumbnailUrl: Nullable<string>;
+  thumbnailUrl: string;
+  channelId: string;
+  categoryId: string;
   isLive: boolean;
   viewerCount: number;
-  category: Nullable<string>;
-  startedAt: Nullable<Date>;
-  platform: StreamPlatform;
-  quality: StreamQuality[];
+  startedAt: Date | string;
+  status: StreamStatus;
+}
+
+export interface Channel extends BaseEntity {
+  id: string;
+  name: string;
+  handle: string;
+  avatarUrl: string;
+  subscriberCount: number;
+  verified: boolean;
+}
+
+export interface Category extends BaseEntity {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+}
+
+export type StreamStatus = 'live' | 'offline' | 'scheduled';
+
+export interface PaginatedResponse<T> {
+  data: T[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+  };
 }
 
 export interface StreamFilters {
-  platform?: StreamPlatform;
-  category?: string;
-  isLive?: boolean;
-  minViewers?: number;
-  maxViewers?: number;
+  status?: StreamStatus;
+  categoryId?: string;
+  channelId?: string;
+  search?: string;
+  sortBy?: 'viewerCount' | 'startedAt' | 'title';
+  sortOrder?: 'asc' | 'desc';
 }
 
-export interface PaginatedResponse<T> {
-  items: T[];
-  total: number;
-  page: number;
-  pageSize: number;
-  hasMore: boolean;
+export interface ChannelFilters {
+  verified?: boolean;
+  search?: string;
+  sortBy?: 'subscriberCount' | 'name' | 'createdAt';
+  sortOrder?: 'asc' | 'desc';
 }
