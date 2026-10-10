@@ -1,5 +1,10 @@
+```javascript
 const EventEmitter = require('events');
 const axios = require('axios');
+const cheerio = require('cheerio');
+const { sanitizeSearchQuery, sanitizeUrl, sanitizeHtml } = require('./input-sanitization');
+const { queryCache } = require('./query-cacheService');
+const { validateConfig, validateEnvironment } = require('./environment-guardrails');
 const {
   StreamConfig,
   StreamHealth,
@@ -10,214 +15,166 @@ const {
   Subscription,
   StreamEvent,
   StreamStatus,
-  PlatformType
+  PlatformType,
+  StreamSource,
+  StreamSearchResult,
+  StreamUrlResult,
+  SourceValidationResult
 } = require('../types/domain');
 
 class StreamDomainService extends EventEmitter {
-  constructor() {
+  constructor(config = {}) {
     super();
-    this.streamConfig = null;
-    this.streamStatus = StreamStatus.IDLE;
-    this.currentQuality = StreamQuality.AUTO;
-    this.viewers = new Map();
-    this.chatHistory = [];
-    this.donations = [];
-    this.subscriptions = [];
-    this.healthMetrics = {
-      bitrate: 0,
-      fps: 0,
-      droppedFrames: 0,
-      latency: 0,
-      uptime: 0,
-      viewerCount: 0,
-      chatRate: 0,
-      errorRate: 0
-    };
-    this.startTime = null;
-    this.healthCheckInterval = null;
-    this.platformClients = new Map();
-    this.eventBuffer = [];
-    this.maxEventBufferSize = 1000;
-    this._setupEventHandlers();
-  }
+    
+    validateEnvironment();
+    const validatedConfig = validateConfig(config, {
+      baseUrls: { type: 'object', required: true },
+      timeout: { type: 'number', default: 10000 },
+      userAgent: { type: 'string', default: 'Mozilla/5.0 (compatible; StreamBot/1.0)' },
+      cacheTtl: { type: 'number', default: 300000 },
+      maxConcurrentRequests: { type: 'number', default: 5 },
+      retryAttempts: { type: 'number', default: 3 },
+      retryDelay: { type: 'number', default: 1000 }
+    });
 
-  _setupEventHandlers() {
-    this.on('viewer:join', (viewer) => this._handleViewerJoinInternal(viewer));
-    this.on('viewer:leave', (viewer) => this._handleViewerLeaveInternal(viewer));
-    this.on('chat:message', (message) => this._processChatMessageInternal(message));
-    this.on('donation:received', (donation) => this._processDonationInternal(donation));
-    this.on('subscription:new', (sub) => this._processSubscriptionInternal(sub));
-    this.on('stream:started', () => this._onStreamStarted());
-    this.on('stream:stopped', () => this._onStreamStopped());
-    this.on('quality:changed', (quality) => this._onQualityChanged(quality));
-    this.on('health:update', (health) => this._onHealthUpdate(health));
-    this.on('error', (error) => this._onError(error));
-  }
+    this.config = validatedConfig;
+    this.baseUrls = validatedConfig.baseUrls;
+    this.timeout = validatedConfig.timeout;
+    this.userAgent = validatedConfig.userAgent;
+    this.cacheTtl = validatedConfig.cacheTtl;
+    this.maxConcurrentRequests = validatedConfig.maxConcurrentRequests;
+    this.retryAttempts = validatedConfig.retryAttempts;
+    this.retryDelay = validatedConfig.retryDelay;
 
-  async initializeStream(config) {
-    if (!(config instanceof StreamConfig)) {
-      throw new Error('Invalid stream configuration');
-    }
-
-    this.streamConfig = config;
-    this.streamStatus = StreamStatus.INITIALIZING;
-    this.currentQuality = config.defaultQuality || StreamQuality.AUTO;
-    this.viewers.clear();
-    this.chatHistory = [];
-    this.donations = [];
-    this.subscriptions = [];
-    this.healthMetrics = {
-      bitrate: 0,
-      fps: 0,
-      droppedFrames: 0,
-      latency: 0,
-      uptime: 0,
-      viewerCount: 0,
-      chatRate: 0,
-      errorRate: 0
-    };
-
-    await this._initializePlatformClients(config.platforms);
-    await this._validateStreamConfiguration(config);
-
-    this.emit('stream:initialized', { config: this.streamConfig });
-    return { success: true, streamId: config.streamId };
-  }
-
-  async _initializePlatformClients(platforms) {
-    for (const platform of platforms) {
-      try {
-        const client = await this._createPlatformClient(platform);
-        this.platformClients.set(platform.type, client);
-      } catch (error) {
-        this.emit('error', { platform: platform.type, error: error.message });
-      }
-    }
-  }
-
-  async _createPlatformClient(platformConfig) {
-    const baseURL = this._getPlatformBaseURL(platformConfig.type);
-    const client = axios.create({
-      baseURL,
-      timeout: 10000,
+    this.httpClient = axios.create({
+      timeout: this.timeout,
       headers: {
-        'Authorization': `Bearer ${platformConfig.accessToken}`,
-        'Client-ID': platformConfig.clientId,
-        'Content-Type': 'application/json'
+        'User-Agent': this.userAgent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive'
       }
     });
 
-    client.interceptors.response.use(
+    this.httpClient.interceptors.response.use(
       response => response,
       error => {
-        this.emit('platform:error', { platform: platformConfig.type, error: error.message });
+        this.emit('http:error', { url: error.config?.url, error: error.message });
         return Promise.reject(error);
       }
     );
 
-    return client;
+    this.sourceValidators = new Map();
+    this.selectorCache = new Map();
+    this._initializeSourceValidators();
+    this._setupEventHandlers();
   }
 
-  _getPlatformBaseURL(platformType) {
-    const urls = {
-      [PlatformType.TWITCH]: 'https://api.twitch.tv/helix',
-      [PlatformType.YOUTUBE]: 'https://www.googleapis.com/youtube/v3',
-      [PlatformType.FACEBOOK]: 'https://graph.facebook.com/v18.0',
-      [PlatformType.TROVO]: 'https://open-api.trovo.live',
-      [PlatformType.KICK]: 'https://api.kick.com/public/v1',
-      [PlatformType.RUMBLE]: 'https://rumble.com/api',
-      [PlatformType.CUSTOM]: ''
-    };
-    return urls[platformType] || '';
+  _setupEventHandlers() {
+    this.on('search:started', (query) => this._onSearchStarted(query));
+    this.on('search:completed', (results) => this._onSearchCompleted(results));
+    this.on('search:error', (error) => this._onSearchError(error));
+    this.on('url:resolved', (result) => this._onUrlResolved(result));
+    this.on('url:error', (error) => this._onUrlError(error));
+    this.on('source:validated', (result) => this._onSourceValidated(result));
+    this.on('source:health:check', (result) => this._onSourceHealthCheck(result));
   }
 
-  async _validateStreamConfiguration(config) {
-    if (!config.streamKey) {
-      throw new Error('Stream key is required');
-    }
-    if (!config.rtmpUrl) {
-      throw new Error('RTMP URL is required');
-    }
-    if (config.platforms.length === 0) {
-      throw new Error('At least one platform must be configured');
-    }
+  _initializeSourceValidators() {
+    this.sourceValidators.set('primary', this._validatePrimarySource.bind(this));
+    this.sourceValidators.set('secondary', this._validateSecondarySource.bind(this));
+    this.sourceValidators.set('tertiary', this._validateTertiarySource.bind(this));
+    this.sourceValidators.set('custom', this._validateCustomSource.bind(this));
   }
 
-  async startStream() {
-    if (this.streamStatus === StreamStatus.LIVE) {
-      return { success: false, error: 'Stream is already live' };
+  async searchStreams(query, options = {}) {
+    const sanitizedQuery = sanitizeSearchQuery(query);
+    const cacheKey = `search:${sanitizedQuery}:${JSON.stringify(options)}`;
+    
+    const cached = queryCache.get(cacheKey);
+    if (cached) {
+      this.emit('search:cache:hit', { query: sanitizedQuery });
+      return cached;
     }
 
-    if (!this.streamConfig) {
-      return { success: false, error: 'Stream not initialized' };
+    this.emit('search:started', { query: sanitizedQuery, options });
+
+    const sources = options.sources || Object.keys(this.baseUrls);
+    const searchPromises = sources.map(source => this._searchSource(source, sanitizedQuery, options));
+    
+    const results = await this._executeWithConcurrencyControl(searchPromises, this.maxConcurrentRequests);
+    const flattenedResults = results.flat().filter(Boolean);
+    
+    const deduplicated = this._deduplicateResults(flattenedResults);
+    const sorted = this._sortResults(deduplicated, options.sortBy || 'relevance');
+    
+    const finalResults = sorted.slice(0, options.limit || 50);
+    
+    queryCache.set(cacheKey, finalResults, this.cacheTtl);
+    
+    this.emit('search:completed', { query: sanitizedQuery, count: finalResults.length });
+    return finalResults;
+  }
+
+  async _searchSource(sourceName, query, options) {
+    const baseUrl = this.baseUrls[sourceName];
+    if (!baseUrl) {
+      this.emit('source:not:found', { source: sourceName });
+      return [];
     }
 
-    this.streamStatus = StreamStatus.STARTING;
-    this.startTime = Date.now();
-
+    const searchUrl = this._buildSearchUrl(baseUrl, query, options);
+    
     try {
-      await this._startPlatformStreams();
-      this.streamStatus = StreamStatus.LIVE;
-      this._startHealthMonitoring();
-      this.emit('stream:started', { streamId: this.streamConfig.streamId, startTime: this.startTime });
-      return { success: true, streamId: this.streamConfig.streamId };
-    } catch (error) {
-      this.streamStatus = StreamStatus.ERROR;
-      this.emit('error', { phase: 'start', error: error.message });
-      return { success: false, error: error.message };
-    }
-  }
-
-  async _startPlatformStreams() {
-    const startPromises = Array.from(this.platformClients.entries()).map(
-      async ([platform, client]) => {
-        try {
-          await this._startPlatformStream(platform, client);
-        } catch (error) {
-          this.emit('platform:start:error', { platform, error: error.message });
+      const response = await this._retryRequest(() => this.httpClient.get(searchUrl));
+      const $ = cheerio.load(response.data);
+      
+      const selectors = this._getSelectorsForSource(sourceName);
+      const results = [];
+      
+      $(selectors.item).each((index, element) => {
+        if (index >= (options.perSourceLimit || 20)) return false;
+        
+        const result = this._parseSearchResult($, element, selectors, sourceName);
+        if (result) {
+          results.push(result);
         }
-      }
-    );
-    await Promise.allSettled(startPromises);
-  }
-
-  async _startPlatformStream(platform, client) {
-    switch (platform) {
-      case PlatformType.TWITCH:
-        await client.post('/streams', { stream_key: this.streamConfig.streamKey });
-        break;
-      case PlatformType.YOUTUBE:
-        await client.post('/liveBroadcasts', {
-          part: 'snippet,status,contentDetails',
-          broadcast: {
-            snippet: { title: this.streamConfig.title },
-            status: { privacyStatus: this.streamConfig.privacy || 'public' }
-          }
-        });
-        break;
-      case PlatformType.FACEBOOK:
-        await client.post(`/${this.streamConfig.facebookPageId}/live_videos`, {
-          title: this.streamConfig.title,
-          stream_key: this.streamConfig.streamKey
-        });
-        break;
-      case PlatformType.KICK:
-        await client.post('/livestreams', {
-          stream_key: this.streamConfig.streamKey,
-          title: this.streamConfig.title
-        });
-        break;
-      default:
-        this.emit('platform:unsupported', { platform });
+      });
+      
+      return results;
+    } catch (error) {
+      this.emit('source:search:error', { source: sourceName, error: error.message });
+      return [];
     }
   }
 
-  async stopStream() {
-    if (this.streamStatus !== StreamStatus.LIVE) {
-      return { success: false, error: 'Stream is not live' };
+  _buildSearchUrl(baseUrl, query, options) {
+    const url = new URL(baseUrl);
+    url.searchParams.set('q', query);
+    if (options.category) url.searchParams.set('category', options.category);
+    if (options.language) url.searchParams.set('lang', options.language);
+    if (options.page) url.searchParams.set('page', options.page);
+    return sanitizeUrl(url.toString());
+  }
+
+  _getSelectorsForSource(sourceName) {
+    if (this.selectorCache.has(sourceName)) {
+      return this.selectorCache.get(sourceName);
     }
 
-    this.streamStatus = StreamStatus.STOPPING;
+    const selectors = {
+      item: '.stream-item, .video-item, .result-item, [data-stream-id]',
+      title: '.title, .stream-title, h3, h4',
+      url: 'a[href]',
+      thumbnail: 'img[src], [data-src]',
+      viewerCount: '.viewers, .view-count, [data-viewers]',
+      platform: '.platform, .source-badge',
+      isLive: '.live-badge, .is-live, [data-live="true"]',
+      quality: '.quality, .resolution',
+      category: '.category, .game-name',
+      streamer: '.streamer, .channel-name, .author'
+    };
 
-    try {
-      await
+    const sourceSpecificSelectors = this._getSourceSpecificSelectors(sourceName);
+    const merged = { ...selectors, ...source
