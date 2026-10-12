@@ -7,6 +7,7 @@
 
 const axios = require('axios');
 const cheerio = require('cheerio');
+const QueryCacheService = require('./query-cacheService.js');
 
 /**
  * Custom error class for StreamService operations
@@ -85,6 +86,8 @@ class StreamService {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
     });
+
+    this.cache = new QueryCacheService({ ttl: 300000, maxSize: 100 });
   }
 
   /**
@@ -135,52 +138,51 @@ class StreamService {
   }
 
   /**
-   * Fetch a single stream by ID
-   * @param {string} id
-   * @returns {Promise<Stream>}
+   * Search streams with query caching
+   * @param {Object} params
+   * @param {string} params.query
+   * @param {string} [params.category]
+   * @param {number} [params.page=1]
+   * @param {number} [params.limit=20]
+   * @param {string} [params.sortBy]
+   * @param {string} [params.sortOrder]
+   * @returns {Promise<PaginatedResponse<Stream>>}
    */
-  async fetchStreamById(id) {
-    if (!id) {
-      throw new StreamServiceError('Stream ID is required', 400, 'INVALID_ID');
+  async searchStreams(params) {
+    const { query, category, page = 1, limit = 20, sortBy, sortOrder } = params;
+    
+    if (!query || typeof query !== 'string' || query.trim().length === 0) {
+      throw new StreamServiceError('Search query is required', 400, 'INVALID_QUERY');
     }
+
+    const cacheKey = JSON.stringify({
+      query: query.trim(),
+      category,
+      page,
+      limit,
+      sortBy,
+      sortOrder,
+    });
+
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const searchParams = new URLSearchParams();
+    searchParams.append('q', query.trim());
+    if (category) searchParams.append('category', category);
+    searchParams.append('page', page.toString());
+    searchParams.append('limit', limit.toString());
+    if (sortBy) searchParams.append('sortBy', sortBy);
+    if (sortOrder) searchParams.append('sortOrder', sortOrder);
 
     try {
-      const response = await this.axiosInstance.get(`${this.baseUrl}/streams/${encodeURIComponent(id)}`);
-      const $ = cheerio.load(response.data);
-
-      const stream = this.parseStreamCard($('.stream-detail, [data-stream-detail], .stream-container').first());
-      if (!stream) {
-        throw new StreamServiceError('Stream not found', 404, 'NOT_FOUND');
-      }
-
-      const validation = this.validateStream(stream);
-      if (!validation.valid) {
-        throw new StreamServiceError('Stream validation failed', 422, 'VALIDATION_ERROR');
-      }
-
-      return validation.data;
-    } catch (error) {
-      if (error instanceof StreamServiceError) throw error;
-      throw StreamServiceError.fromAxiosError(error);
-    }
-  }
-
-  /**
-   * Fetch streams for a specific channel
-   * @param {string} channelId
-   * @returns {Promise<Stream[]>}
-   */
-  async fetchChannelStreams(channelId) {
-    if (!channelId) {
-      throw new StreamServiceError('Channel ID is required', 400, 'INVALID_CHANNEL_ID');
-    }
-
-    try {
-      const response = await this.axiosInstance.get(`${this.baseUrl}/channels/${encodeURIComponent(channelId)}/streams`);
+      const response = await this.axiosInstance.get(`${this.baseUrl}/streams/search`, { params: searchParams });
       const $ = cheerio.load(response.data);
 
       const streams = [];
-      $('.stream-card, [data-stream-card], .stream-item').each((_, element) => {
+      $('.stream-card, [data-stream-card], .stream-item, .search-result-item').each((_, element) => {
         const stream = this.parseStreamCard($(element));
         if (stream) {
           const validation = this.validateStream(stream);
@@ -190,26 +192,19 @@ class StreamService {
         }
       });
 
-      return streams;
-    } catch (error) {
-      throw StreamServiceError.fromAxiosError(error);
-    }
-  }
+      const totalElements = parseInt($('.pagination .total, [data-total-count], .results-count').first().text() || streams.length, 10);
+      const totalPages = Math.ceil(totalElements / limit);
 
-  /**
-   * Parse a stream card element into a Stream object
-   * @param {cheerio.Cheerio<Element>} $element
-   * @returns {Stream|null}
-   * @private
-   */
-  parseStreamCard($element) {
-    if (!$element || !$element.length) return null;
+      const result = {
+        data: streams,
+        pagination: {
+          page,
+          limit,
+          totalElements,
+          totalPages,
+          hasNext: page < totalPages,
+          hasPrev: page > 1,
+        },
+      };
 
-    const $card = $element;
-
-    // Extract title
-    const title = $card.find('.stream-title, [data-title], h3, h4, .title').first().text().trim();
-    if (!title) return null;
-
-    // Extract URL
-    const url = $card.find('a[href*="/stream/"], a[href*="/watch/"], a.stream-link').
+      this.cache.set(cacheKey,
