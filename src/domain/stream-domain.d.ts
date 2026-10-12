@@ -1,4 +1,4 @@
-import { BaseEntity } from '../types/common.d.ts';
+import { BaseEntity } from '../../types/common.d.ts';
 
 export enum StreamQuality {
   SD = 'SD',
