@@ -1,0 +1,235 @@
+openapi: 3.1.0
+info:
+  title: voidsStreamer API
+  version: 1.0.0
+  description: |
+    REST API for searching and resolving streaming sources.
+    Provides endpoints for stream search, resolution, source listing, and health checks.
+  contact:
+    name: voidsStreamer Team
+    email: support@voidsstreamer.example.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Development server
+  - url: https://api.voidsstreamer.example.com
+    description: Production server
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /api/streams/search:
+    get:
+      summary: Search for streams
+      description: |
+        Search for streaming content by query, type, and optional filters.
+        Returns a paginated list of stream results with basic metadata.
+      operationId: searchStreams
+      tags:
+        - Streams
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: q
+          in: query
+          description: Search query string
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+            example: "The Matrix"
+        - name: type
+          in: query
+          description: Type of content to search for
+          required: true
+          schema:
+            type: string
+            enum: [movie, series, anime]
+            example: movie
+        - name: page
+          in: query
+          description: Page number for pagination (1-indexed)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+            example: 1
+        - name: limit
+          in: query
+          description: Number of results per page
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+            example: 20
+        - name: year
+          in: query
+          description: Filter by release year
+          required: false
+          schema:
+            type: integer
+            minimum: 1900
+            maximum: 2100
+            example: 1999
+        - name: genre
+          in: query
+          description: Filter by genre
+          required: false
+          schema:
+            type: string
+            example: "sci-fi"
+      responses:
+        '200':
+          description: Successful search response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamSearchResponse'
+              examples:
+                success:
+                  summary: Successful search for "The Matrix"
+                  value:
+                    results:
+                      - id: "tt0133093"
+                        title: "The Matrix"
+                        type: "movie"
+                        year: 1999
+                        poster: "https://image.tmdb.org/t/p/w500/f89U3ADr1oiB1s9GkdPOEpXUk5H.jpg"
+                        overview: "A computer hacker learns from mysterious rebels about the true nature of his reality and his role in the war against its controllers."
+                        genres: ["Action", "Sci-Fi"]
+                        rating: 8.7
+                      - id: "tt0234215"
+                        title: "The Matrix Reloaded"
+                        type: "movie"
+                        year: 2003
+                        poster: "https://image.tmdb.org/t/p/w500/9TGHDvWrq4bUo2FZM1YJxNQZPVT.jpg"
+                        overview: "Neo and the rebel leaders estimate that they have 72 hours until 250,000 probes discover Zion and destroy it and its inhabitants."
+                        genres: ["Action", "Sci-Fi"]
+                        rating: 7.2
+                    pagination:
+                      page: 1
+                      limit: 20
+                      totalResults: 2
+                      totalPages: 1
+        '400':
+          description: Bad request - validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missing_query:
+                  summary: Missing required query parameter
+                  value:
+                    error:
+                      code: "VALIDATION_ERROR"
+                      message: "Query parameter 'q' is required"
+                      details:
+                        - field: "q"
+                          message: "Search query is required"
+                invalid_type:
+                  summary: Invalid type parameter
+                  value:
+                    error:
+                      code: "VALIDATION_ERROR"
+                      message: "Invalid value for parameter 'type'"
+                      details:
+                        - field: "type"
+                          message: "Must be one of: movie, series, anime"
+        '401':
+          description: Unauthorized - invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalid_key:
+                  summary: Invalid API key
+                  value:
+                    error:
+                      code: "UNAUTHORIZED"
+                      message: "Invalid API key"
+        '429':
+          description: Too many requests - rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                rate_limited:
+                  summary: Rate limit exceeded
+                  value:
+                    error:
+                      code: "RATE_LIMIT_EXCEEDED"
+                      message: "Rate limit exceeded. Try again in 60 seconds."
+                      details:
+                        - field: "retryAfter"
+                          message: "60"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                server_error:
+                  summary: Internal server error
+                  value:
+                    error:
+                      code: "INTERNAL_ERROR"
+                      message: "An unexpected error occurred"
+
+  /api/streams/{id}/resolve:
+    get:
+      summary: Resolve stream sources
+      description: |
+        Resolve available streaming sources for a specific content ID.
+        Returns a list of playable sources with quality, language, and provider information.
+      operationId: resolveStream
+      tags:
+        - Streams
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          description: Content identifier (IMDb ID, TMDB ID, or internal ID)
+          required: true
+          schema:
+            type: string
+            pattern: '^(tt|tmdb|vs)[0-9]+$'
+            example: "tt0133093"
+        - name: season
+          in: query
+          description: Season number (required for series)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+        - name: episode
+          in: query
+          description: Episode number (required for series)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+        - name: quality
+          in: query
+          description: Preferred quality filter
+          required: false
+          schema:
+            type: string
+            enum: [480p, 720p, 1080p, 4k]
+            example: "1080p"
+        - name: language
+          in:
