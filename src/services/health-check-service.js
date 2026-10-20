@@ -2,9 +2,11 @@
 'use strict';
 
 const axios = require('axios');
+const cheerio = require('cheerio');
 const { QueryCacheService } = require('./query-cache-service');
 const { StreamDomainService } = require('./stream-domain-service');
 const { config } = require('../config/environment');
+const { telemetryService } = require('./telemetry-service');
 
 class HealthCheckService {
   constructor() {
@@ -33,6 +35,12 @@ class HealthCheckService {
     const statuses = Object.values(results).map(r => r.status);
     const overallStatus = statuses.includes('unhealthy') ? 'unhealthy' : 
                           statuses.includes('degraded') ? 'degraded' : 'healthy';
+
+    telemetryService.recordGauge('health_check_overall_status', overallStatus === 'healthy' ? 1 : overallStatus === 'degraded' ? 0.5 : 0);
+    telemetryService.recordGauge('health_check_database_status', results.database.status === 'healthy' ? 1 : 0);
+    telemetryService.recordGauge('health_check_cache_status', results.cache.status === 'healthy' ? 1 : 0);
+    telemetryService.recordGauge('health_check_upstream_status', results.upstreamSources.status === 'healthy' ? 1 : 0);
+    telemetryService.recordGauge('health_check_memory_status', results.memory.status === 'healthy' ? 1 : 0);
 
     return {
       status: overallStatus,
@@ -134,30 +142,30 @@ class HealthCheckService {
             url: source.baseUrl,
             status: 'unhealthy',
             latency: Date.now() - start,
-            error: error.code || error.message
+            error: error.message
           };
         }
       });
 
       const results = await Promise.all(checkPromises);
       const healthyCount = results.filter(r => r.status === 'healthy').length;
-      const unhealthyCount = results.filter(r => r.status === 'unhealthy').length;
+      const avgLatency = results.reduce((sum, r) => sum + r.latency, 0) / results.length;
 
-      let overallStatus = 'healthy';
-      if (unhealthyCount > 0 && healthyCount === 0) {
-        overallStatus = 'unhealthy';
-      } else if (unhealthyCount > 0) {
-        overallStatus = 'degraded';
+      let status = 'healthy';
+      if (healthyCount === 0) {
+        status = 'unhealthy';
+      } else if (healthyCount < results.length || avgLatency > 3000) {
+        status = 'degraded';
       }
 
       return {
-        status: overallStatus,
+        status,
         details: {
           total: sources.length,
           active: activeSources.length,
           checked: results.length,
           healthy: healthyCount,
-          unhealthy: unhealthyCount,
+          averageLatency: `${Math.round(avgLatency)}ms`,
           sources: results
         }
       };
@@ -169,43 +177,26 @@ class HealthCheckService {
     }
   }
 
-  checkMemory() {
-    const usage = process.memoryUsage();
-    const heapUsedMB = Math.round(usage.heapUsed / 1024 / 1024);
-    const heapTotalMB = Math.round(usage.heapTotal / 1024 / 1024);
-    const rssMB = Math.round(usage.rss / 1024 / 1024);
-    const heapUtilization = (usage.heapUsed / usage.heapTotal) * 100;
+  async checkMemory() {
+    try {
+      const memUsage = process.memoryUsage();
+      const heapUsedMB = (memUsage.heapUsed / 1024 / 1024).toFixed(2);
+      const heapTotalMB = (memUsage.heapTotal / 1024 / 1024).toFixed(2);
+      const rssMB = (memUsage.rss / 1024 / 1024).toFixed(2);
+      const externalMB = (memUsage.external / 1024 / 1024).toFixed(2);
+      const heapUtilization = (memUsage.heapUsed / memUsage.heapTotal * 100).toFixed(2);
 
-    let status = 'healthy';
-    if (heapUtilization > 90) {
-      status = 'unhealthy';
-    } else if (heapUtilization > 75) {
-      status = 'degraded';
-    }
-
-    return {
-      status,
-      details: {
-        heapUsed: `${heapUsedMB} MB`,
-        heapTotal: `${heapTotalMB} MB`,
-        rss: `${rssMB} MB`,
-        heapUtilization: `${heapUtilization.toFixed(2)}%`,
-        external: `${Math.round(usage.external / 1024 / 1024)} MB`,
-        arrayBuffers: `${Math.round(usage.arrayBuffers / 1024 / 1024)} MB`
+      let status = 'healthy';
+      if (heapUtilization > 90) {
+        status = 'unhealthy';
+      } else if (heapUtilization > 75) {
+        status = 'degraded';
       }
-    };
-  }
 
-  checkUptime() {
-    const uptimeMs = Date.now() - this.startTime;
-    const uptimeSeconds = Math.floor(uptimeMs / 1000);
-    const days = Math.floor(uptimeSeconds / 86400);
-    const hours = Math.floor((uptimeSeconds % 86400) / 3600);
-    const minutes = Math.floor((uptimeSeconds % 3600) / 60);
-    const seconds = uptimeSeconds % 60;
+      telemetryService.recordGauge('memory_heap_used_mb', parseFloat(heapUsedMB));
+      telemetryService.recordGauge('memory_heap_total_mb', parseFloat(heapTotalMB));
+      telemetryService.recordGauge('memory_rss_mb', parseFloat(rssMB));
+      telemetryService.recordGauge('memory_heap_utilization_percent', parseFloat(heapUtilization));
 
-    return {
-      status: 'healthy',
-      details: {
-        uptimeMs,
-        uptimeHuman: `${days}d ${hours}h ${minutes}m ${seconds}s
+      return {
+        status
