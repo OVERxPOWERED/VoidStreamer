@@ -1,3 +1,4 @@
+```javascript
 const fs = require('fs');
 const path = require('path');
 
@@ -17,7 +18,43 @@ const ENV_SCHEMA = {
       return value;
     }
   },
-  CACHE_TTL_MS: {
+  UPSTREAM_SOURCES: {
+    type: 'string',
+    required: true,
+    description: 'Comma-separated list of upstream source URLs or path to sources config',
+    validate: (value) => {
+      if (!value || value.trim() === '') {
+        throw new Error('UPSTREAM_SOURCES cannot be empty');
+      }
+      return value.trim();
+    }
+  },
+  PORT: {
+    type: 'number',
+    required: true,
+    description: 'HTTP server port',
+    validate: (value) => {
+      const num = Number(value);
+      if (isNaN(num) || num < 1 || num > 65535) {
+        throw new Error('PORT must be a number between 1 and 65535');
+      }
+      return num;
+    }
+  },
+  NODE_ENV: {
+    type: 'string',
+    required: false,
+    default: 'development',
+    description: 'Node environment',
+    validate: (value) => {
+      const validEnvs = ['development', 'production', 'test', 'staging'];
+      if (!validEnvs.includes(value)) {
+        throw new Error(`NODE_ENV must be one of: ${validEnvs.join(', ')}`);
+      }
+      return value;
+    }
+  },
+  CACHE_TTL: {
     type: 'number',
     required: false,
     default: 300000,
@@ -25,9 +62,80 @@ const ENV_SCHEMA = {
     validate: (value) => {
       const num = Number(value);
       if (isNaN(num) || num < 1000 || num > 86400000) {
+        throw new Error('CACHE_TTL must be a number between 1000 and 86400000 (1s - 24h)');
+      }
+      return num;
+    }
+  },
+  CACHE_TTL_MS: {
+    type: 'number',
+    required: false,
+    default: 300000,
+    description: 'Cache TTL in milliseconds (default: 5 minutes) - alias for CACHE_TTL',
+    validate: (value) => {
+      const num = Number(value);
+      if (isNaN(num) || num < 1000 || num > 86400000) {
         throw new Error('CACHE_TTL_MS must be a number between 1000 and 86400000 (1s - 24h)');
       }
       return num;
+    }
+  },
+  RATE_LIMIT_WINDOW: {
+    type: 'number',
+    required: false,
+    default: 60000,
+    description: 'Rate limit window in milliseconds (default: 1 minute)',
+    validate: (value) => {
+      const num = Number(value);
+      if (isNaN(num) || num < 1000 || num > 3600000) {
+        throw new Error('RATE_LIMIT_WINDOW must be a number between 1000 and 3600000 (1s - 1h)');
+      }
+      return num;
+    }
+  },
+  RATE_LIMIT_MAX: {
+    type: 'number',
+    required: false,
+    default: 100,
+    description: 'Maximum requests per rate limit window (default: 100)',
+    validate: (value) => {
+      const num = Number(value);
+      if (isNaN(num) || num < 1 || num > 10000) {
+        throw new Error('RATE_LIMIT_MAX must be a number between 1 and 10000');
+      }
+      return num;
+    }
+  },
+  LOG_LEVEL: {
+    type: 'string',
+    required: false,
+    default: 'info',
+    description: 'Log level (debug, info, warn, error)',
+    validate: (value) => {
+      const validLevels = ['debug', 'info', 'warn', 'error'];
+      const level = value.toLowerCase();
+      if (!validLevels.includes(level)) {
+        throw new Error(`LOG_LEVEL must be one of: ${validLevels.join(', ')}`);
+      }
+      return level;
+    }
+  },
+  TELEMETRY_ENDPOINT: {
+    type: 'string',
+    required: false,
+    default: '',
+    description: 'OpenTelemetry collector endpoint (optional)',
+    validate: (value) => {
+      if (value && value.trim() !== '') {
+        const url = value.trim();
+        try {
+          new URL(url);
+        } catch {
+          throw new Error('TELEMETRY_ENDPOINT must be a valid URL');
+        }
+        return url;
+      }
+      return '';
     }
   },
   REQUEST_TIMEOUT_MS: {
@@ -54,33 +162,6 @@ const ENV_SCHEMA = {
         throw new Error('MAX_CONCURRENT_REQUESTS must be a number between 1 and 100');
       }
       return num;
-    }
-  },
-  LOG_LEVEL: {
-    type: 'string',
-    required: false,
-    default: 'info',
-    description: 'Log level (debug, info, warn, error)',
-    validate: (value) => {
-      const validLevels = ['debug', 'info', 'warn', 'error'];
-      const level = value.toLowerCase();
-      if (!validLevels.includes(level)) {
-        throw new Error(`LOG_LEVEL must be one of: ${validLevels.join(', ')}`);
-      }
-      return level;
-    }
-  },
-  NODE_ENV: {
-    type: 'string',
-    required: false,
-    default: 'development',
-    description: 'Node environment',
-    validate: (value) => {
-      const validEnvs = ['development', 'production', 'test', 'staging'];
-      if (!validEnvs.includes(value)) {
-        throw new Error(`NODE_ENV must be one of: ${validEnvs.join(', ')}`);
-      }
-      return value;
     }
   }
 };
@@ -114,70 +195,3 @@ function validateEnvironment() {
 
     try {
       let parsedValue = rawValue;
-
-      if (schema.type === 'number') {
-        parsedValue = Number(rawValue);
-        if (isNaN(parsedValue)) {
-          throw new Error(`Expected number, got: ${rawValue}`);
-        }
-      } else if (schema.type === 'boolean') {
-        parsedValue = rawValue === 'true' || rawValue === '1';
-      }
-
-      if (schema.validate) {
-        parsedValue = schema.validate(parsedValue);
-      }
-
-      config[key] = parsedValue;
-    } catch (error) {
-      errors.push(`Invalid value for ${key}: ${error.message}`);
-    }
-  }
-
-  if (errors.length > 0) {
-    const errorMessage = [
-      'Environment validation failed:',
-      ...errors.map(e => `  - ${e}`),
-      '',
-      'Required variables:',
-      ...Object.entries(ENV_SCHEMA)
-        .filter(([, s]) => s.required)
-        .map(([k, s]) => `  - ${k}: ${s.description}`)
-    ].join('\n');
-
-    throw new Error(errorMessage);
-  }
-
-  validatedConfig = Object.freeze(config);
-  isValidated = true;
-
-  console.log('[Environment] Validation successful. Config loaded:', {
-    STREAM_SOURCES_CONFIG: config.STREAM_SOURCES_CONFIG,
-    CACHE_TTL_MS: config.CACHE_TTL_MS,
-    REQUEST_TIMEOUT_MS: config.REQUEST_TIMEOUT_MS,
-    MAX_CONCURRENT_REQUESTS: config.MAX_CONCURRENT_REQUESTS,
-    LOG_LEVEL: config.LOG_LEVEL,
-    NODE_ENV: config.NODE_ENV
-  });
-
-  return validatedConfig;
-}
-
-function getConfig() {
-  if (!isValidated) {
-    return validateEnvironment();
-  }
-  return validatedConfig;
-}
-
-function resetValidation() {
-  validatedConfig = null;
-  isValidated = false;
-}
-
-module.exports = {
-  validateEnvironment,
-  getConfig,
-  resetValidation,
-  ENV_SCHEMA
-};
