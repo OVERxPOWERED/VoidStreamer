@@ -1,10 +1,18 @@
+```javascript
 const { getConfig } = require('../config/environment-guardrails');
+const { AppError, ErrorCodes } = require('./input-sanitization-service');
 
 class TelemetryService {
   constructor() {
     this.serviceName = 'stream-domain-service';
     this.logLevel = this._getLogLevel();
     this.metrics = new Map();
+    this.spans = new Map();
+    this.healthCheckService = null;
+  }
+
+  setHealthCheckService(healthCheckService) {
+    this.healthCheckService = healthCheckService;
   }
 
   _getLogLevel() {
@@ -34,6 +42,10 @@ class TelemetryService {
 
   generateTraceId() {
     return `trace-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+  }
+
+  generateSpanId() {
+    return `span-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
   }
 
   info(message, traceId, meta = {}) {
@@ -76,6 +88,52 @@ class TelemetryService {
     this.metrics.set(key, existing);
     
     this.debug(`Metric recorded: ${name}`, tags.traceId, { name, value, tags, stats: existing });
+    
+    if (this.healthCheckService && name.startsWith('health.')) {
+      this.healthCheckService.recordMetric(name, value, tags);
+    }
+  }
+
+  recordCounter(name, tags = {}, increment = 1) {
+    const key = `counter:${name}:${JSON.stringify(tags)}`;
+    const existing = this.metrics.get(key) || { count: 0, tags };
+    existing.count += increment;
+    existing.lastUpdated = new Date().toISOString();
+    this.metrics.set(key, existing);
+    return existing.count;
+  }
+
+  recordGauge(name, value, tags = {}) {
+    const key = `gauge:${name}:${JSON.stringify(tags)}`;
+    const existing = this.metrics.get(key) || { tags };
+    existing.value = value;
+    existing.lastUpdated = new Date().toISOString();
+    this.metrics.set(key, existing);
+    return value;
+  }
+
+  recordHistogram(name, value, tags = {}) {
+    const key = `histogram:${name}:${JSON.stringify(tags)}`;
+    const existing = this.metrics.get(key) || { 
+      count: 0, 
+      sum: 0, 
+      min: Infinity, 
+      max: -Infinity,
+      values: [],
+      tags 
+    };
+    
+    existing.count += 1;
+    existing.sum += value;
+    existing.min = Math.min(existing.min, value);
+    existing.max = Math.max(existing.max, value);
+    existing.avg = existing.sum / existing.count;
+    existing.values.push(value);
+    if (existing.values.length > 1000) {
+      existing.values.shift();
+    }
+    existing.lastUpdated = new Date().toISOString();
+    this.metrics.set(key, existing);
   }
 
   getMetrics() {
@@ -84,6 +142,11 @@ class TelemetryService {
       result[key] = { ...value };
     }
     return result;
+  }
+
+  getMetric(name, tags = {}) {
+    const key = `${name}:${JSON.stringify(tags)}`;
+    return this.metrics.get(key) || null;
   }
 
   resetMetrics() {
@@ -142,39 +205,9 @@ class TelemetryService {
       error: {
         name: error?.name || 'Error',
         message: error?.message || String(error),
-        stack: error?.stack,
-        code: error?.code || error?.statusCode || error?.status
+        code: error?.code || error?.statusCode || error?.status,
+        stack: error?.stack
       },
       context: {
         ...context,
         service: this.serviceName
-      }
-    };
-    
-    this.error(`Error recorded: ${classification}`, traceId, errorRecord);
-    
-    this.recordMetric('error.count', 1, { 
-      classification, 
-      traceId,
-      service: this.serviceName 
-    });
-    
-    return errorRecord;
-  }
-
-  createChildLogger(traceId) {
-    return {
-      info: (message, meta) => this.info(message, traceId, meta),
-      warn: (message, meta) => this.warn(message, traceId, meta),
-      error: (message, meta) => this.error(message, traceId, meta),
-      debug: (message, meta) => this.debug(message, traceId, meta),
-      recordMetric: (name, value, tags) => this.recordMetric(name, value, { ...tags, traceId }),
-      recordError: (error, context) => this.recordError(error, { ...context, traceId }),
-      traceId
-    };
-  }
-}
-
-const telemetryService = new TelemetryService();
-
-module.exports = { TelemetryService, telemetryService };
