@@ -21,6 +21,14 @@ servers:
 security:
   - ApiKeyAuth: []
 
+tags:
+  - name: Streams
+    description: Stream search and resolution operations
+  - name: Sources
+    description: Source management and listing
+  - name: Health
+    description: Health check and system status
+
 paths:
   /api/streams/search:
     get:
@@ -126,24 +134,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
               examples:
-                missing_query:
-                  summary: Missing required query parameter
+                validation_error:
+                  summary: Missing required parameter
                   value:
-                    error:
-                      code: "VALIDATION_ERROR"
-                      message: "Query parameter 'q' is required"
-                      details:
-                        - field: "q"
-                          message: "Search query is required"
-                invalid_type:
-                  summary: Invalid type parameter
-                  value:
-                    error:
-                      code: "VALIDATION_ERROR"
-                      message: "Invalid value for parameter 'type'"
-                      details:
-                        - field: "type"
-                          message: "Must be one of: movie, series, anime"
+                    error: "ValidationError"
+                    message: "Query parameter 'q' is required"
+                    statusCode: 400
+                    details:
+                      - field: "q"
+                        message: "Search query is required"
         '401':
           description: Unauthorized - invalid or missing API key
           content:
@@ -151,12 +150,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
               examples:
-                invalid_key:
+                unauthorized:
                   summary: Invalid API key
                   value:
-                    error:
-                      code: "UNAUTHORIZED"
-                      message: "Invalid API key"
+                    error: "UnauthorizedError"
+                    message: "Invalid or missing API key"
+                    statusCode: 401
         '429':
           description: Too many requests - rate limit exceeded
           content:
@@ -167,12 +166,10 @@ paths:
                 rate_limited:
                   summary: Rate limit exceeded
                   value:
-                    error:
-                      code: "RATE_LIMIT_EXCEEDED"
-                      message: "Rate limit exceeded. Try again in 60 seconds."
-                      details:
-                        - field: "retryAfter"
-                          message: "60"
+                    error: "RateLimitError"
+                    message: "Rate limit exceeded. Please try again later."
+                    statusCode: 429
+                    retryAfter: 60
         '500':
           description: Internal server error
           content:
@@ -183,53 +180,48 @@ paths:
                 server_error:
                   summary: Internal server error
                   value:
-                    error:
-                      code: "INTERNAL_ERROR"
-                      message: "An unexpected error occurred"
+                    error: "InternalServerError"
+                    message: "An unexpected error occurred"
+                    statusCode: 500
+        '503':
+          description: Service unavailable - upstream services down
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                service_unavailable:
+                  summary: Upstream service unavailable
+                  value:
+                    error: "ServiceUnavailableError"
+                    message: "Upstream search service is temporarily unavailable"
+                    statusCode: 503
+                    retryAfter: 30
 
-  /api/streams/{id}/resolve:
+  /api/streams:
     get:
-      summary: Resolve stream sources
+      summary: List streams
       description: |
-        Resolve available streaming sources for a specific content ID.
-        Returns a list of playable sources with quality, language, and provider information.
-      operationId: resolveStream
+        Retrieve a paginated list of streams with optional filtering.
+        Supports filtering by type, genre, year range, and sorting.
+      operationId: listStreams
       tags:
         - Streams
       security:
         - ApiKeyAuth: []
       parameters:
-        - name: id
-          in: path
-          description: Content identifier (IMDb ID, TMDB ID, or internal ID)
-          required: true
-          schema:
-            type: string
-            pattern: '^(tt|tmdb|vs)[0-9]+$'
-            example: "tt0133093"
-        - name: season
+        - name: type
           in: query
-          description: Season number (required for series)
-          required: false
-          schema:
-            type: integer
-            minimum: 1
-            example: 1
-        - name: episode
-          in: query
-          description: Episode number (required for series)
-          required: false
-          schema:
-            type: integer
-            minimum: 1
-            example: 1
-        - name: quality
-          in: query
-          description: Preferred quality filter
+          description: Filter by content type
           required: false
           schema:
             type: string
-            enum: [480p, 720p, 1080p, 4k]
-            example: "1080p"
-        - name: language
-          in:
+            enum: [movie, series, anime]
+            example: movie
+        - name: genre
+          in: query
+          description: Filter by genre
+          required: false
+          schema:
+            type: string
+            example: "action
