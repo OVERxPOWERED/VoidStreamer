@@ -6,21 +6,26 @@ class QueryCacheService {
     this.accessOrder = new Map();
     this.maxSize = 1000;
     this.defaultTtl = CACHE_TTL_MS || 300000;
+    this.hits = 0;
+    this.misses = 0;
   }
 
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) {
+      this.misses++;
       return null;
     }
 
     if (Date.now() > entry.expiresAt) {
       this.cache.delete(key);
       this.accessOrder.delete(key);
+      this.misses++;
       return null;
     }
 
     this.accessOrder.set(key, Date.now());
+    this.hits++;
     return entry.value;
   }
 
@@ -47,6 +52,8 @@ class QueryCacheService {
   clear() {
     this.cache.clear();
     this.accessOrder.clear();
+    this.hits = 0;
+    this.misses = 0;
   }
 
   evictLRU() {
@@ -72,10 +79,13 @@ class QueryCacheService {
   }
 
   getStats() {
+    const total = this.hits + this.misses;
     return {
       size: this.cache.size,
       maxSize: this.maxSize,
-      hitRate: this.hitRate || 0
+      hitRate: total > 0 ? this.hits / total : 0,
+      hits: this.hits,
+      misses: this.misses
     };
   }
 }
