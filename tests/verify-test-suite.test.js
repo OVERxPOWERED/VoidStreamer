@@ -1,4 +1,3 @@
-```javascript
 // Test Suite: Verify test suite green status and assertion benchmarks (Milestone 4: Verification & Automated Testing)
 // Verified by GitBrain Autonomous Engine
 
@@ -171,4 +170,13 @@ function validateCoverageThresholds(coverage) {
   };
 }
 
-function generateBenchmarkReport
+export function generateBenchmarkReport(results = []) {
+  return {
+    timestamp: new Date().toISOString(),
+    thresholds: COVERAGE_THRESHOLDS,
+    results,
+    status: Array.isArray(results) && results.every((r) => r && r.success) ? 'passed' : 'failed'
+  };
+}
+
+export { runTestSuite, compareRunsForFlakiness, validateCoverageThresholds };
