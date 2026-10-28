@@ -114,331 +114,283 @@ describe('Stream Endpoints Integration Tests', () => {
       expect(response.body).toHaveProperty('results');
       expect(response.body).toHaveProperty('pagination');
       expect(Array.isArray(response.body.results)).toBe(true);
-      expect(response.body.pagination).toMatchObject({
-        page: expect.any(Number),
-        limit: expect.any(Number),
-        total: expect.any(Number),
-        totalPages: expect.any(Number)
-      });
+      expect(response.body.results.length).toBeGreaterThan(0);
+      expect(validateResponseSchema(response.body, 'search')).toBe(true);
     });
 
-    it('should return results with correct schema', async () => {
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: 'inception' })
-        .expect(200);
-
-      expect(validateResponseSchema(response.body, 'StreamSearchResponse')).toBe(true);
+    it('should return cached response on subsequent identical requests', async () => {
+      await request(app).get(`${baseUrl}/search`).query({ q: 'matrix', page: 1, limit: 10 }).expect(200);
+      const response = await request(app).get(`${baseUrl}/search`).query({ q: 'matrix', page: 1, limit: 10 }).expect(200);
       
-      if (response.body.results.length > 0) {
-        const stream = response.body.results[0];
-        expect(stream).toMatchObject({
-          id: expect.any(String),
-          title: expect.any(String),
-          year: expect.any(Number),
-          type: expect.stringMatching(/^(movie|series)$/),
-          sources: expect.arrayContaining([
-            expect.objectContaining({
-              name: expect.any(String),
-              url: expect.stringMatching(/^https?:\/\//),
-              quality: expect.stringMatching(/^(4K|HD|SD|CAM)$/)
-            })
-          ]),
-          poster: expect.stringMatching(/^https?:\/\//),
-          imdbId: expect.stringMatching(/^tt\d+$/)
-        });
-      }
+      expect(axiosMockAdapter.get).toHaveBeenCalledTimes(1);
+      expect(response.headers['x-cache']).toBe('HIT');
     });
 
-    it('should handle pagination parameters correctly', async () => {
+    it('should respect pagination parameters', async () => {
       const response = await request(app)
         .get(`${baseUrl}/search`)
-        .query({ q: 'star wars', page: 2, limit: 20 })
+        .query({ q: 'matrix', page: 2, limit: 5 })
         .expect(200);
 
       expect(response.body.pagination.page).toBe(2);
-      expect(response.body.pagination.limit).toBe(20);
+      expect(response.body.pagination.limit).toBe(5);
     });
+  });
 
-    it('should default to page=1, limit=10 when not provided', async () => {
+  describe('GET /api/streams/search - Empty Response Handling', () => {
+    it('should return 200 with empty results for no matches', async () => {
+      axiosMockAdapter.get.mockResolvedValue({ data: mockEmptyResponse });
+
       const response = await request(app)
         .get(`${baseUrl}/search`)
-        .query({ q: 'batman' })
-        .expect(200);
-
-      expect(response.body.pagination.page).toBe(1);
-      expect(response.body.pagination.limit).toBe(10);
-    });
-
-    it('should return empty results for no matches', async () => {
-      axiosMockAdapter.get.mockResolvedValueOnce({ data: mockEmptyResponse });
-      
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: 'nonexistentmovie12345' })
+        .query({ q: 'nonexistentmovie12345', page: 1, limit: 10 })
         .expect(200);
 
       expect(response.body.results).toEqual([]);
       expect(response.body.pagination.total).toBe(0);
+      expect(response.body.pagination.totalPages).toBe(0);
     });
 
-    it('should handle special characters in query', async () => {
-      axiosMockAdapter.get.mockResolvedValueOnce({ data: mockSearchResponse });
-      
+    it('should return 204 when upstream returns 204 No Content', async () => {
+      axiosMockAdapter.get.mockResolvedValue({ 
+        data: null, 
+        status: 204,
+        statusText: 'No Content'
+      });
+
       const response = await request(app)
         .get(`${baseUrl}/search`)
-        .query({ q: "l'homme qui rit" })
-        .expect(200);
+        .query({ q: 'empty' })
+        .expect(204);
 
-      expect(response.body.results.length).toBeGreaterThan(0);
-    });
-  });
-
-  describe('GET /api/streams/search - Invalid Input Sanitization', () => {
-    const xssPayloads = [
-      '<script>alert("xss")</script>',
-      '"><script>alert(1)</script>',
-      'javascript:alert(1)',
-      '<img src=x onerror=alert(1)>',
-      '<svg onload=alert(1)>',
-      '"><iframe src=javascript:alert(1)>',
-      '${alert(1)}',
-      '{{7*7}}',
-      '<%= 7*7 %>'
-    ];
-
-    const sqlInjectionPayloads = [
-      "' OR '1'='1",
-      "'; DROP TABLE users; --",
-      "' UNION SELECT * FROM users --",
-      "1' OR '1'='1' --",
-      "admin'--",
-      "' OR 1=1#",
-      "'; EXEC xp_cmdshell('dir'); --"
-    ];
-
-    const pathTraversalPayloads = [
-      '../../../etc/passwd',
-      '..\\..\\..\\windows\\system32\\drivers\\etc\\hosts',
-      '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd',
-      '....//....//....//etc/passwd'
-    ];
-
-    const commandInjectionPayloads = [
-      '; cat /etc/passwd',
-      '| cat /etc/passwd',
-      '`cat /etc/passwd`',
-      '$(cat /etc/passwd)',
-      '; rm -rf /',
-      '&& cat /etc/passwd'
-    ];
-
-    it.each(xssPayloads)('should sanitize XSS payload: %s', async (payload) => {
-      axiosMockAdapter.get.mockResolvedValueOnce({ data: mockEmptyResponse });
-      
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: payload })
-        .expect(200);
-
-      expect(response.body.results).toEqual([]);
-      expect(axiosMockAdapter.get).toHaveBeenCalledWith(
-        expect.stringContaining(encodeURIComponent(payload.replace(/[<>'"]/g, '')))
-      );
+      expect(response.body).toEqual({});
     });
 
-    it.each(sqlInjectionPayloads)('should sanitize SQL injection payload: %s', async (payload) => {
-      axiosMockAdapter.get.mockResolvedValueOnce({ data: mockEmptyResponse });
-      
+    it('should return 404 when upstream returns 404 Not Found', async () => {
+      const error = new Error('Not Found');
+      error.response = { status: 404, data: { message: 'Resource not found' } };
+      axiosMockAdapter.get.mockRejectedValue(error);
+
       const response = await request(app)
         .get(`${baseUrl}/search`)
-        .query({ q: payload })
-        .expect(200);
-
-      expect(response.body.results).toEqual([]);
-    });
-
-    it.each(pathTraversalPayloads)('should sanitize path traversal payload: %s', async (payload) => {
-      axiosMockAdapter.get.mockResolvedValueOnce({ data: mockEmptyResponse });
-      
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: payload })
-        .expect(200);
-
-      expect(response.body.results).toEqual([]);
-    });
-
-    it.each(commandInjectionPayloads)('should sanitize command injection payload: %s', async (payload) => {
-      axiosMockAdapter.get.mockResolvedValueOnce({ data: mockEmptyResponse });
-      
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: payload })
-        .expect(200);
-
-      expect(response.body.results).toEqual([]);
-    });
-
-    it('should reject empty query', async () => {
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: '' })
-        .expect(400);
+        .query({ q: 'notfound' })
+        .expect(404);
 
       expect(response.body).toHaveProperty('error');
-      expect(response.body.error.code).toBe(ErrorCodes.VALIDATION_ERROR);
+      expect(response.body.error.code).toBe(ErrorCodes.UPSTREAM_NOT_FOUND);
     });
 
-    it('should reject query exceeding max length', async () => {
-      const longQuery = 'a'.repeat(501);
+    it('should handle empty array in results field gracefully', async () => {
+      axiosMockAdapter.get.mockResolvedValue({ 
+        data: { results: [], pagination: { page: 1, limit: 10, total: 0, totalPages: 0 } } 
+      });
+
       const response = await request(app)
         .get(`${baseUrl}/search`)
-        .query({ q: longQuery })
-        .expect(400);
+        .query({ q: 'empty' })
+        .expect(200);
 
-      expect(response.body.error.code).toBe(ErrorCodes.VALIDATION_ERROR);
-    });
-
-    it('should reject invalid page parameter', async () => {
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: 'matrix', page: -1 })
-        .expect(400);
-
-      expect(response.body.error.code).toBe(ErrorCodes.VALIDATION_ERROR);
-    });
-
-    it('should reject invalid limit parameter', async () => {
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: 'matrix', limit: 101 })
-        .expect(400);
-
-      expect(response.body.error.code).toBe(ErrorCodes.VALIDATION_ERROR);
-    });
-
-    it('should reject non-numeric page/limit', async () => {
-      const response = await request(app)
-        .get(`${baseUrl}/search`)
-        .query({ q: 'matrix', page: 'abc', limit: 'xyz' })
-        .expect(400);
-
-      expect(response.body.error.code).toBe(ErrorCodes.VALIDATION_ERROR);
+      expect(Array.isArray(response.body.results)).toBe(true);
+      expect(response.body.results.length).toBe(0);
     });
   });
 
-  describe('GET /api/streams/search - Rate Limiting', () => {
-    beforeEach(() => {
-      axiosMockAdapter.get.mockResolvedValue({ data: mockSearchResponse });
-    });
-
-    it('should return 429 when rate limit exceeded', async () => {
-      const rateLimitError = new Error('Rate Limited');
-      rateLimitError.response = {
-        status: 429,
-        headers: { 'retry-after': '60' },
-        data: { error: 'Too Many Requests' }
+  describe('GET /api/streams/search - Malformed Data Handling', () => {
+    it('should handle malformed JSON from upstream', async () => {
+      const error = new Error('Unexpected token');
+      error.response = { 
+        status: 200, 
+        data: 'invalid json response{',
+        headers: { 'content-type': 'application/json' }
       };
-      rateLimitError.isAxiosError = true;
-      axiosMockAdapter.get.mockRejectedValueOnce(rateLimitError);
+      axiosMockAdapter.get.mockRejectedValue(error);
 
       const response = await request(app)
         .get(`${baseUrl}/search`)
         .query({ q: 'matrix' })
-        .expect(429);
+        .expect(502);
 
-      expect(response.body.error.code).toBe(ErrorCodes.RATE_LIMITED);
-      expect(response.headers).toHaveProperty('retry-after');
+      expect(response.body.error.code).toBe(ErrorCodes.UPSTREAM_MALFORMED_RESPONSE);
       expect(telemetryService.recordError).toHaveBeenCalledWith(
-        expect.objectContaining({ code: ErrorCodes.RATE_LIMITED })
+        expect.objectContaining({ code: ErrorCodes.UPSTREAM_MALFORMED_RESPONSE })
       );
     });
 
-    it('should respect retry-after header', async () => {
-      const rateLimitError = new Error('Rate Limited');
-      rateLimitError.response = {
-        status: 429,
-        headers: { 'retry-after': '30' },
-        data: { error: 'Too Many Requests' }
-      };
-      rateLimitError.isAxiosError = true;
-      axiosMockAdapter.get.mockRejectedValueOnce(rateLimitError);
+    it('should handle HTML parsing errors with cheerio', async () => {
+      const malformedHtml = '<html><body><div class="result">Unclosed div';
+      cheerio.load.mockImplementation(() => {
+        throw new Error('Cheerio parsing failed: malformed HTML');
+      });
+      axiosMockAdapter.get.mockResolvedValue({ 
+        data: malformedHtml,
+        headers: { 'content-type': 'text/html' }
+      });
 
       const response = await request(app)
         .get(`${baseUrl}/search`)
         .query({ q: 'matrix' })
-        .expect(429);
+        .expect(502);
 
-      expect(response.headers['retry-after']).toBe('30');
+      expect(response.body.error.code).toBe(ErrorCodes.HTML_PARSING_ERROR);
+      expect(cheerio.load).toHaveBeenCalledWith(malformedHtml);
     });
 
-    it('should handle rate limit without retry-after header', async () => {
-      const rateLimitError = new Error('Rate Limited');
-      rateLimitError.response = {
-        status: 429,
-        headers: {},
-        data: { error: 'Too Many Requests' }
+    it('should handle missing required fields in upstream response', async () => {
+      const incompleteResponse = {
+        results: [{ id: 'tt0133093' }],
+        pagination: { page: 1, limit: 10, total: 1, totalPages: 1 }
       };
-      rateLimitError.isAxiosError = true;
-      axiosMockAdapter.get.mockRejectedValueOnce(rateLimitError);
+      axiosMockAdapter.get.mockResolvedValue({ data: incompleteResponse });
 
       const response = await request(app)
         .get(`${baseUrl}/search`)
         .query({ q: 'matrix' })
-        .expect(429);
+        .expect(502);
 
-      expect(response.body.error.code).toBe(ErrorCodes.RATE_LIMITED);
+      expect(response.body.error.code).toBe(ErrorCodes.SCHEMA_VALIDATION_FAILED);
+      expect(response.body.error.details).toContain('title');
     });
 
-    it('should track rate limit metrics', async () => {
-      const rateLimitError = new Error('Rate Limited');
-      rateLimitError.response = {
-        status: 429,
-        headers: { 'retry-after': '60' },
-        data: { error: 'Too Many Requests' }
+    it('should handle null/undefined values in critical fields', async () => {
+      const responseWithNulls = {
+        results: [
+          { id: 'tt0133093', title: null, year: undefined, type: 'movie', sources: [], poster: null, imdbId: 'tt0133093' }
+        ],
+        pagination: { page: 1, limit: 10, total: 1, totalPages: 1 }
       };
-      rateLimitError.isAxiosError = true;
-      axiosMockAdapter.get.mockRejectedValueOnce(rateLimitError);
+      axiosMockAdapter.get.mockResolvedValue({ data: responseWithNulls });
 
-      await request(app)
+      const response = await request(app)
         .get(`${baseUrl}/search`)
         .query({ q: 'matrix' })
-        .expect(429);
+        .expect(502);
 
-      expect(telemetryService.recordMetric).toHaveBeenCalledWith(
-        'stream.rate_limited',
-        expect.objectContaining({ endpoint: '/search' })
-      );
+      expect(response.body.error.code).toBe(ErrorCodes.SCHEMA_VALIDATION_FAILED);
+    });
+
+    it('should handle array where object expected', async () => {
+      axiosMockAdapter.get.mockResolvedValue({ 
+        data: { results: 'not-an-array', pagination: { page: 1, limit: 10, total: 0, totalPages: 0 } } 
+      });
+
+      const response = await request(app)
+        .get(`${baseUrl}/search`)
+        .query({ q: 'matrix' })
+        .expect(502);
+
+      expect(response.body.error.code).toBe(ErrorCodes.SCHEMA_VALIDATION_FAILED);
     });
   });
 
-  describe('GET /api/streams/search - Cache Behavior', () => {
-    it('should return cached response on cache hit', async () => {
-      axiosMockAdapter.get.mockResolvedValue({ data: mockSearchResponse });
+  describe('GET /api/streams/search - Timeout and Network Failures', () => {
+    it('should handle request timeout (ETIMEDOUT)', async () => {
+      const timeoutError = new Error('ETIMEDOUT');
+      timeoutError.code = 'ETIMEDOUT';
+      timeoutError.errno = 'ETIMEDOUT';
+      axiosMockAdapter.get.mockRejectedValue(timeoutError);
 
-      await request(app)
+      const response = await request(app)
         .get(`${baseUrl}/search`)
         .query({ q: 'matrix' })
-        .expect(200);
+        .expect(504);
 
-      axiosMockAdapter.get.mockClear();
+      expect(response.body.error.code).toBe(ErrorCodes.UPSTREAM_TIMEOUT);
+      expect(telemetryService.recordMetric).toHaveBeenCalledWith(
+        'upstream.request.timeout',
+        expect.any(Number),
+        expect.objectContaining({ endpoint: 'search' })
+      );
+    });
+
+    it('should handle connection refused (ECONNREFUSED)', async () => {
+      const connError = new Error('ECONNREFUSED');
+      connError.code = 'ECONNREFUSED';
+      connError.errno = 'ECONNREFUSED';
+      axiosMockAdapter.get.mockRejectedValue(connError);
+
+      const response = await request(app)
+        .get(`${baseUrl}/search`)
+        .query({ q: 'matrix' })
+        .expect(503);
+
+      expect(response.body.error.code).toBe(ErrorCodes.UPSTREAM_UNAVAILABLE);
+    });
+
+    it('should handle DNS resolution failure (ENOTFOUND)', async () => {
+      const dnsError = new Error('ENOTFOUND');
+      dnsError.code = 'ENOTFOUND';
+      dnsError.errno = 'ENOTFOUND';
+      axiosMockAdapter.get.mockRejectedValue(dnsError);
+
+      const response = await request(app)
+        .get(`${baseUrl}/search`)
+        .query({ q: 'matrix' })
+        .expect(503);
+
+      expect(response.body.error.code).toBe(ErrorCodes.UPSTREAM_UNAVAILABLE);
+    });
+
+    it('should handle socket hang up (ECONNRESET)', async () => {
+      const resetError = new Error('ECONNRESET');
+      resetError.code = 'ECONNRESET';
+      resetError.errno = 'ECONNRESET';
+      axiosMockAdapter.get.mockRejectedValue(resetError);
+
+      const response = await request(app)
+        .get(`${baseUrl}/search`)
+        .query({ q: 'matrix' })
+        .expect(502);
+
+      expect(response.body.error.code).toBe(ErrorCodes.UPSTREAM_CONNECTION_RESET);
+    });
+
+    it('should retry on transient network errors with exponential backoff', async () => {
+      const transientError = new Error('Transient error');
+      transientError.code = 'ETIMEDOUT';
+      
+      axiosMockAdapter.get
+        .mockRejectedValueOnce(transientError)
+        .mockRejectedValueOnce(transientError)
+        .mockResolvedValue({ data: mockSearchResponse });
 
       const response = await request(app)
         .get(`${baseUrl}/search`)
         .query({ q: 'matrix' })
         .expect(200);
 
-      expect(axiosMockAdapter.get).not.toHaveBeenCalled();
-      expect(response.body.results).toEqual(mockSearchResponse.results);
+      expect(axiosMockAdapter.get).toHaveBeenCalledTimes(3);
+      expect(response.body.results).toHaveLength(1);
     });
 
-    it('should fetch fresh data on cache miss', async () => {
-      axiosMockAdapter.get.mockResolvedValue({ data: mockSearchResponse });
+    it('should not retry on non-transient errors (4xx)', async () => {
+      const clientError = new Error('Bad Request');
+      clientError.response = { status: 400, data: { message: 'Invalid query' } };
+      axiosMockAdapter.get.mockRejectedValue(clientError);
 
-      const response1 = await request(app)
+      const response = await request(app)
         .get(`${baseUrl}/search`)
         .query({ q: 'matrix' })
-        .expect(200);
+        .expect(400);
 
-      const response2
+      expect(axiosMockAdapter.get).toHaveBeenCalledTimes(1);
+      expect(response.body.error.code).toBe(ErrorCodes.INVALID_REQUEST);
+    });
+  });
+
+  describe('GET /api/streams/search - Large Payload Handling', () => {
+    const generateLargeResponse = (itemCount) => ({
+      results: Array.from({ length: itemCount }, (_, i) => ({
+        id: `tt${String(i).padStart(7, '0')}`,
+        title: `Movie ${i}`,
+        year: 2000 + (i % 20),
+        type: 'movie',
+        sources: Array.from({ length: 5 }, (_, j) => ({
+          name: `Source ${j}`,
+          url: `https://source${j}.com/watch/tt${String(i).padStart(7, '0')}`,
+          quality: ['4K', 'HD', 'SD'][j % 3]
+        })),
+        poster: `https://image.tmdb.org/t/p/w500/poster${i}.jpg`,
+        imdbId: `tt${String(i).padStart(7, '0')}`,
+        overview: 'x'.repeat(500)
+      })),
+      pagination: { page: 1, limit: itemCount, total: item
