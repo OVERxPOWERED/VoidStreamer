@@ -8,16 +8,24 @@ class CircuitBreaker {
   constructor(options = {}) {
     this.failureThreshold = options.failureThreshold || 5;
     this.resetTimeout = options.resetTimeout || 30000;
+    this.successThreshold = options.successThreshold || 2;
     this.failureCount = 0;
+    this.successCount = 0;
     this.lastFailureTime = null;
     this.state = 'CLOSED';
+    this.totalRequests = 0;
+    this.rejectedRequests = 0;
   }
 
   async execute(operation) {
+    this.totalRequests++;
+
     if (this.state === 'OPEN') {
       if (Date.now() - this.lastFailureTime >= this.resetTimeout) {
         this.state = 'HALF_OPEN';
+        this.successCount = 0;
       } else {
+        this.rejectedRequests++;
         throw new Error('Circuit breaker is OPEN');
       }
     }
@@ -33,14 +41,26 @@ class CircuitBreaker {
   }
 
   onSuccess() {
-    this.failureCount = 0;
-    this.state = 'CLOSED';
+    if (this.state === 'HALF_OPEN') {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this.state = 'CLOSED';
+        this.failureCount = 0;
+        this.successCount = 0;
+      }
+    } else if (this.state === 'CLOSED') {
+      this.failureCount = 0;
+    }
   }
 
   onFailure() {
     this.failureCount++;
     this.lastFailureTime = Date.now();
-    if (this.failureCount >= this.failureThreshold) {
+    
+    if (this.state === 'HALF_OPEN') {
+      this.state = 'OPEN';
+      this.successCount = 0;
+    } else if (this.state === 'CLOSED' && this.failureCount >= this.failureThreshold) {
       this.state = 'OPEN';
     }
   }
@@ -49,10 +69,24 @@ class CircuitBreaker {
     return this.state;
   }
 
+  getMetrics() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      lastFailureTime: this.lastFailureTime,
+      totalRequests: this.totalRequests,
+      rejectedRequests: this.rejectedRequests
+    };
+  }
+
   reset() {
     this.failureCount = 0;
+    this.successCount = 0;
     this.lastFailureTime = null;
     this.state = 'CLOSED';
+    this.totalRequests = 0;
+    this.rejectedRequests = 0;
   }
 }
 
@@ -88,7 +122,8 @@ class StreamScraperService {
     
     this.circuitBreaker = new CircuitBreaker({
       failureThreshold: options.circuitBreakerThreshold || 5,
-      resetTimeout: options.circuitBreakerResetTimeout || 30000
+      resetTimeout: options.circuitBreakerResetTimeout || 30000,
+      successThreshold: options.circuitBreakerSuccessThreshold || 2
     });
 
     this.userAgents = this.config.get('scraper.userAgents') || [
@@ -129,363 +164,228 @@ class StreamScraperService {
     return this.userAgents[index];
   }
 
-  async sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  calculateBackoff(attempt) {
-    const delay = this.baseDelay * Math.pow(2, attempt);
-    const jitter = Math.random() * 0.3 * delay;
-    return Math.floor(delay + jitter);
-  }
-
-  classifyError(error) {
-    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-      return new StreamScraperError('Request timeout', ERROR_CODES.TIMEOUT_ERROR, { originalError: error.message });
-    }
-    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ENETUNREACH') {
-      return new StreamScraperError('Network error', ERROR_CODES.NETWORK_ERROR, { originalError: error.message });
-    }
-    if (error.response) {
-      return new StreamScraperError(
-        `HTTP ${error.response.status}`,
-        ERROR_CODES.HTTP_ERROR,
-        { status: error.response.status, statusText: error.response.statusText }
-      );
-    }
-    if (error.message?.includes('Circuit breaker')) {
-      return new StreamScraperError('Circuit breaker open', ERROR_CODES.CIRCUIT_OPEN);
-    }
-    return new StreamScraperError('Unknown error', ERROR_CODES.NETWORK_ERROR, { originalError: error.message });
-  }
-
-  async fetchWithRetry(url, options = {}, correlationId = null) {
+  async scrape(url, options = {}) {
     const startTime = Date.now();
+    const requestId = options.requestId || `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    this.logger.info('Starting scrape request', { url, requestId });
+
+    try {
+      const result = await this.circuitBreaker.execute(async () => {
+        return await this.scrapeWithRetry(url, options, requestId);
+      });
+
+      const duration = Date.now() - startTime;
+      this.telemetry.recordScrapeSuccess(url, duration);
+      this.logger.info('Scrape completed successfully', { url, requestId, duration });
+
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      this.telemetry.recordScrapeFailure(url, duration, error.code || 'UNKNOWN');
+      this.logger.error('Scrape failed', { url, requestId, duration, error: error.message, code: error.code });
+      throw error;
+    }
+  }
+
+  async scrapeWithRetry(url, options, requestId) {
     let lastError;
-
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+    
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
-        const result = await this.circuitBreaker.execute(async () => {
-          const headers = {
-            ...options.headers,
-            'User-Agent': this.getRandomUserAgent()
-          };
-
-          if (correlationId) {
-            headers['X-Correlation-ID'] = correlationId;
-          }
-
-          const response = await this.axiosInstance.get(url, {
-            ...options,
-            headers
-          });
-
-          if (response.status >= 400) {
-            throw new StreamScraperError(
-              `HTTP ${response.status}`,
-              ERROR_CODES.HTTP_ERROR,
-              { status: response.status, url }
-            );
-          }
-
-          return response;
-        });
-
-        const duration = Date.now() - startTime;
-        this.telemetry.recordHttpRequest({
-          url,
-          method: 'GET',
-          statusCode: result.status,
-          duration,
-          success: true
-        });
-
-        this.logger.info('Stream fetch successful', {
-          correlationId,
-          url,
-          statusCode: result.status,
-          duration,
-          attempt: attempt + 1
-        });
-
-        return result;
+        const response = await this.makeRequest(url, options, requestId, attempt);
+        return this.parseResponse(response, url, options);
       } catch (error) {
-        lastError = this.classifyError(error);
+        lastError = error;
         
-        this.logger.warn('Stream fetch attempt failed', {
-          correlationId,
-          url,
-          attempt: attempt + 1,
-          maxRetries: this.maxRetries,
-          error: lastError.message,
-          errorCode: lastError.code
-        });
-
-        if (attempt < this.maxRetries && this.isRetryableError(lastError)) {
-          const delay = this.calculateBackoff(attempt);
-          await this.sleep(delay);
-          continue;
+        if (error.code === ERROR_CODES.CIRCUIT_OPEN) {
+          throw error;
         }
-        break;
+
+        if (attempt < this.maxRetries) {
+          const delay = this.calculateBackoff(attempt);
+          this.logger.warn('Retrying scrape', { url, requestId, attempt, delay, error: error.message });
+          await this.sleep(delay);
+        }
       }
     }
-
-    const duration = Date.now() - startTime;
-    this.telemetry.recordHttpRequest({
-      url,
-      method: 'GET',
-      statusCode: lastError?.details?.status || 0,
-      duration,
-      success: false,
-      error: lastError?.code
-    });
 
     throw new StreamScraperError(
       `Max retries (${this.maxRetries}) exceeded for ${url}`,
       ERROR_CODES.MAX_RETRIES_EXCEEDED,
-      { lastError: lastError?.message, url }
+      { url, attempts: this.maxRetries, lastError: lastError?.message }
     );
   }
 
-  isRetryableError(error) {
-    return [
-      ERROR_CODES.NETWORK_ERROR,
-      ERROR_CODES.TIMEOUT_ERROR
-    ].includes(error.code) || 
-    (error.code === ERROR_CODES.HTTP_ERROR && error.details.status >= 500);
+  async makeRequest(url, options, requestId, attempt) {
+    const headers = {
+      'User-Agent': options.userAgent || this.getRandomUserAgent(),
+      ...options.headers
+    };
+
+    if (options.referer) {
+      headers['Referer'] = options.referer;
+    }
+
+    try {
+      const response = await this.axiosInstance.get(url, {
+        headers,
+        timeout: this.responseTimeout,
+        signal: options.signal
+      });
+
+      if (response.status >= 400) {
+        throw new StreamScraperError(
+          `HTTP ${response.status} for ${url}`,
+          ERROR_CODES.HTTP_ERROR,
+          { url, status: response.status, attempt }
+        );
+      }
+
+      if (!response.data || typeof response.data !== 'string') {
+        throw new StreamScraperError(
+          'Invalid response: empty or non-string body',
+          ERROR_CODES.INVALID_RESPONSE,
+          { url, attempt }
+        );
+      }
+
+      return response;
+    } catch (error) {
+      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        throw new StreamScraperError(
+          `Request timeout for ${url}`,
+          ERROR_CODES.TIMEOUT_ERROR,
+          { url, attempt, originalError: error.message }
+        );
+      }
+      
+      if (error.isAxiosError) {
+        throw new StreamScraperError(
+          `Network error for ${url}: ${error.message}`,
+          ERROR_CODES.NETWORK_ERROR,
+          { url, attempt, originalError: error.message }
+        );
+      }
+      
+      throw error;
+    }
   }
 
-  parseHtml(html, url) {
+  parseResponse(response, url, options) {
     try {
-      const $ = cheerio.load(html);
+      const $ = cheerio.load(response.data);
       
-      const metadata = {
+      const result = {
         url,
-        title: null,
-        description: null,
-        streams: [],
-        thumbnails: [],
-        metadata: {}
+        statusCode: response.status,
+        headers: response.headers,
+        html: response.data,
+        $,
+        title: $('title').text().trim(),
+        metaDescription: $('meta[name="description"]').attr('content') || '',
+        metaKeywords: $('meta[name="keywords"]').attr('content') || '',
+        canonicalUrl: $('link[rel="canonical"]').attr('href') || url,
+        links: [],
+        images: [],
+        scripts: [],
+        stylesheets: []
       };
 
-      metadata.title = $('title').first().text().trim() || 
-                       $('meta[property="og:title"]').attr('content') ||
-                       $('meta[name="twitter:title"]').attr('content') ||
-                       $('h1').first().text().trim();
-
-      metadata.description = $('meta[property="og:description"]').attr('content') ||
-                             $('meta[name="description"]').attr('content') ||
-                             $('meta[name="twitter:description"]').attr('content') ||
-                             $('p').first().text().trim().substring(0, 500);
-
-      $('meta[property^="og:"]').each((i, el) => {
-        const property = $(el).attr('property');
-        const content = $(el).attr('content');
-        if (property && content) {
-          metadata.metadata[property] = content;
-        }
-      });
-
-      $('meta[name^="twitter:"]').each((i, el) => {
-        const name = $(el).attr('name');
-        const content = $(el).attr('content');
-        if (name && content) {
-          metadata.metadata[name] = content;
-        }
-      });
-
-      $('link[rel="preload"][as="video"], link[rel="preload"][as="audio"]').each((i, el) => {
-        const href = $(el).attr('href');
-        const type = $(el).attr('type');
-        if (href) {
-          metadata.streams.push({ url: href, type, source: 'preload' });
-        }
-      });
-
-      $('video source, audio source').each((i, el) => {
-        const src = $(el).attr('src');
-        const type = $(el).attr('type');
-        if (src) {
-          metadata.streams.push({ url: src, type, source: 'media-element' });
-        }
-      });
-
-      $('video, audio').each((i, el) => {
-        const src = $(el).attr('src');
-        const type = $(el).attr('type');
-        if (src) {
-          metadata.streams.push({ url: src, type, source: 'media-tag' });
-        }
-      });
-
-      $('a[href$=".m3u8"], a[href$=".mpd"], a[href*=".m3u8"], a[href*=".mpd"]').each((i, el) => {
+      $('a[href]').each((i, el) => {
         const href = $(el).attr('href');
         if (href) {
-          metadata.streams.push({ url: href, type: 'application/vnd.apple.mpegurl', source: 'anchor' });
+          result.links.push({
+            url: this.resolveUrl(url, href),
+            text: $(el).text().trim(),
+            title: $(el).attr('title') || ''
+          });
         }
       });
 
-      $('iframe[src*="player"], iframe[src*="embed"], iframe[src*="stream"]').each((i, el) => {
+      $('img[src]').each((i, el) => {
         const src = $(el).attr('src');
         if (src) {
-          metadata.streams.push({ url: src, type: 'iframe', source: 'iframe' });
+          result.images.push({
+            url: this.resolveUrl(url, src),
+            alt: $(el).attr('alt') || '',
+            title: $(el).attr('title') || ''
+          });
         }
       });
 
-      $('img').each((i, el) => {
-        const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy');
-        if (src && (src.includes('.jpg') || src.includes('.jpeg') || src.includes('.png') || src.includes('.webp'))) {
-          metadata.thumbnails.push(src);
+      $('script[src]').each((i, el) => {
+        const src = $(el).attr('src');
+        if (src) {
+          result.scripts.push(this.resolveUrl(url, src));
         }
       });
 
-      metadata.thumbnails = [...new Set(metadata.thumbnails)].slice(0, 10);
-      metadata.streams = this.deduplicateStreams(metadata.streams);
+      $('link[rel="stylesheet"]').each((i, el) => {
+        const href = $(el).attr('href');
+        if (href) {
+          result.stylesheets.push(this.resolveUrl(url, href));
+        }
+      });
 
-      return metadata;
+      if (options.customSelectors) {
+        result.custom = {};
+        for (const [key, selector] of Object.entries(options.customSelectors)) {
+          result.custom[key] = [];
+          $(selector).each((i, el) => {
+            result.custom[key].push({
+              html: $.html(el),
+              text: $(el).text().trim(),
+              attributes: el.attribs
+            });
+          });
+        }
+      }
+
+      return result;
     } catch (error) {
       throw new StreamScraperError(
-        'Failed to parse HTML',
+        `Failed to parse response from ${url}: ${error.message}`,
         ERROR_CODES.PARSING_ERROR,
-        { originalError: error.message, url }
+        { url, originalError: error.message }
       );
     }
   }
 
-  deduplicateStreams(streams) {
-    const seen = new Set();
-    return streams.filter(stream => {
-      const key = `${stream.url}|${stream.type}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  }
-
-  async scrape(url, options = {}) {
-    const correlationId = options.correlationId || this.logger.generateCorrelationId();
-    const startTime = Date.now();
-
-    this.logger.info('Starting stream scrape', { correlationId, url, options });
-
+  resolveUrl(baseUrl, relativeUrl) {
     try {
-      const response = await this.fetchWithRetry(url, options, correlationId);
-      
-      const contentType = response.headers['content-type'] || '';
-      let metadata;
-
-      if (contentType.includes('text/html')) {
-        metadata = this.parseHtml(response.data, url);
-      } else if (contentType.includes('application/json')) {
-        metadata = { url, data: response.data, contentType };
-      } else {
-        metadata = { url, contentType, rawLength: response.data?.length || 0 };
-      }
-
-      const duration = Date.now() - startTime;
-      
-      this.telemetry.recordScrapeOperation({
-        url,
-        duration,
-        success: true,
-        streamsFound: metadata.streams?.length || 0
-      });
-
-      this.logger.info('Stream scrape completed', {
-        correlationId,
-        url,
-        duration,
-        streamsFound: metadata.streams?.length || 0,
-        hasTitle: !!metadata.title
-      });
-
-      return {
-        success: true,
-        correlationId,
-        metadata,
-        response: {
-          status: response.status,
-          headers: response.headers
-        }
-      };
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      const scraperError = error instanceof StreamScraperError ? error : this.classifyError(error);
-
-      this.telemetry.recordScrapeOperation({
-        url,
-        duration,
-        success: false,
-        error: scraperError.code
-      });
-
-      this.logger.error('Stream scrape failed', {
-        correlationId,
-        url,
-        duration,
-        error: scraperError.message,
-        errorCode: scraperError.code,
-        details: scraperError.details
-      });
-
-      return {
-        success: false,
-        correlationId,
-        error: {
-          code: scraperError.code,
-          message: scraperError.message,
-          details: scraperError.details
-        }
-      };
+      return new URL(relativeUrl, baseUrl).href;
+    } catch {
+      return relativeUrl;
     }
   }
 
-  async scrapeMultiple(urls, options = {}) {
-    const concurrency = options.concurrency || 3;
-    const results = [];
-    const queue = [...urls];
-    const running = new Set();
-
-    const processQueue = async () => {
-      while (queue.length > 0 || running.size > 0) {
-        while (running.size < concurrency && queue.length > 0) {
-          const url = queue.shift();
-          const promise = this.scrape(url, { ...options, correlationId: options.correlationId })
-            .then(result => {
-              results.push(result);
-              running.delete(promise);
-            })
-            .catch(error => {
-              results.push({
-                success: false,
-                url,
-                error: { message: error.message, code: error.code }
-              });
-              running.delete(promise);
-            });
-          running.add(promise);
-        }
-        if (running.size > 0) {
-          await Promise.race(running);
-        }
-      }
-    };
-
-    await processQueue();
-    return results;
+  calculateBackoff(attempt) {
+    const delay = this.baseDelay * Math.pow(2, attempt - 1);
+    const jitter = Math.random() * 0.3 * delay;
+    return Math.min(delay + jitter, 30000);
   }
 
-  getCircuitBreakerState() {
-    return this.circuitBreaker.getState();
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  getCircuitBreakerMetrics() {
+    return this.circuitBreaker.getMetrics();
   }
 
   resetCircuitBreaker() {
     this.circuitBreaker.reset();
   }
 
-  updateConfig(config) {
-    if (config.maxRetries !== undefined) this.maxRetries = config.maxRetries;
-    if (config.baseDelay !== undefined) this.baseDelay = config.baseDelay;
-    if (config.connectTimeout !== undefined) this.connectTimeout = config.connectTimeout;
-    if (config.responseTimeout !== undefined) this.responseTimeout = config.responseTimeout;
-    if
+  getCircuitBreakerState() {
+    return this.circuitBreaker.getState();
+  }
+}
+
+module.exports = {
+  CircuitBreaker,
+  StreamScraperService,
+  StreamScraperError,
+  ERROR_CODES
+};
