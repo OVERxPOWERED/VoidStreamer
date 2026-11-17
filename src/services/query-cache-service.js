@@ -2,6 +2,7 @@ class QueryCacheService {
   constructor(options = {}) {
     this.maxSize = options.maxSize ?? 1000;
     this.defaultTTL = options.defaultTTL ?? 300000;
+    this.onEvict = options.onEvict ?? null;
     this.cache = new Map();
     this.hitCount = 0;
     this.missCount = 0;
@@ -25,9 +26,22 @@ class QueryCacheService {
     }
   }
 
+  getHighResTime() {
+    return process.hrtime.bigint();
+  }
+
+  msToNano(ms) {
+    return BigInt(ms) * 1000000n;
+  }
+
+  nanoToMs(nano) {
+    return Number(nano / 1000000n);
+  }
+
   set(key, value, ttl) {
     const entryTTL = ttl ?? this.defaultTTL;
-    const expiresAt = Date.now() + entryTTL;
+    const now = this.getHighResTime();
+    const expiresAt = now + this.msToNano(entryTTL);
 
     if (this.cache.has(key)) {
       this.cache.delete(key);
@@ -38,7 +52,8 @@ class QueryCacheService {
     this.cache.set(key, {
       value,
       expiresAt,
-      createdAt: Date.now()
+      createdAt: now,
+      accessCount: 0
     });
 
     return this;
@@ -46,13 +61,14 @@ class QueryCacheService {
 
   get(key) {
     const entry = this.cache.get(key);
+    const now = this.getHighResTime();
 
     if (!entry) {
       this.missCount++;
       return null;
     }
 
-    if (Date.now() > entry.expiresAt) {
+    if (now > entry.expiresAt) {
       this.cache.delete(key);
       this.expiredCount++;
       this.missCount++;
@@ -60,6 +76,7 @@ class QueryCacheService {
     }
 
     this.cache.delete(key);
+    entry.accessCount++;
     this.cache.set(key, entry);
     this.hitCount++;
     return entry.value;
@@ -67,12 +84,13 @@ class QueryCacheService {
 
   has(key) {
     const entry = this.cache.get(key);
+    const now = this.getHighResTime();
 
     if (!entry) {
       return false;
     }
 
-    if (Date.now() > entry.expiresAt) {
+    if (now > entry.expiresAt) {
       this.cache.delete(key);
       this.expiredCount++;
       return false;
@@ -97,13 +115,21 @@ class QueryCacheService {
   evictLRU() {
     const firstKey = this.cache.keys().next().value;
     if (firstKey !== undefined) {
+      const evictedEntry = this.cache.get(firstKey);
       this.cache.delete(firstKey);
       this.evictionCount++;
+      if (this.onEvict) {
+        try {
+          this.onEvict(firstKey, evictedEntry?.value);
+        } catch (error) {
+          // Silently ignore callback errors to not break cache operations
+        }
+      }
     }
   }
 
   cleanupExpired() {
-    const now = Date.now();
+    const now = this.getHighResTime();
     let removed = 0;
 
     for (const [key, entry] of this.cache.entries()) {
@@ -117,18 +143,30 @@ class QueryCacheService {
     return removed;
   }
 
+  getKeys() {
+    return Array.from(this.cache.keys());
+  }
+
   getStats() {
     const totalRequests = this.hitCount + this.missCount;
     const hitRate = totalRequests > 0 ? this.hitCount / totalRequests : 0;
+
+    let memoryUsageEstimate = 0;
+    for (const [key, entry] of this.cache.entries()) {
+      memoryUsageEstimate += key.length * 2;
+      memoryUsageEstimate += JSON.stringify(entry.value).length * 2;
+      memoryUsageEstimate += 64;
+    }
 
     return {
       size: this.cache.size,
       maxSize: this.maxSize,
       hitCount: this.hitCount,
       missCount: this.missCount,
-      hitRate: Number(hitRate.toFixed(4)),
       evictionCount: this.evictionCount,
-      expiredCount: this.expiredCount
+      expiredCount: this.expiredCount,
+      hitRate: Number(hitRate.toFixed(4)),
+      memoryUsageEstimate
     };
   }
 
