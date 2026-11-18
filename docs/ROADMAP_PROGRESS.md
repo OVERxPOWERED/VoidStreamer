@@ -31,9 +31,18 @@
 - [x] Enhance QueryCacheService with TTL support, LRU eviction, and comprehensive statistics
 - [x] Add unit tests for CircuitBreaker (8 scenarios) and integration tests for cache TTL/LRU/metrics
 
+### Stream Scheduling & Automation (2026-10-14)
+- [x] Implement StreamSchedulerService with cron expressions and one-time schedules
+- [x] Add schedule persistence with JSON file storage
+- [x] Integrate with StreamRecordingService and StreamServiceOrchestrator
+- [x] Enforce max concurrent recordings via semaphore
+- [x] Emit lifecycle events for monitoring integration
+- [x] Add integration tests with fake timers and persistence verification
+
 ## Checkpoint History
 - **2026-10-14**: Initialized roadmap progress tracker with active project milestones.
 - **2026-10-14**: Completed Milestone 1 (Architecture & Foundation), Milestone 2 (Service Layer & Business Logic), Milestone 3 (Endpoints & Application Integration), and Milestone 4 unit test implementation. All core domain models, validation utilities, service handlers, API endpoints, caching layer, health checks, and unit test suites are now implemented and verified.
 - **2026-10-14**: Completed Milestone 4 (Verification & Automated Testing). Added integration assertions and boundary edge cases for stream endpoints including boundary conditions, rate limiting scenarios, and cache behavior validation. Implemented test suite verification script with CI gates enforcing green status. All assertion benchmarks met: 100% unit test pass rate, 95%+ integration coverage on critical paths, zero flaky tests. Milestone 5 production readiness items remain on track.
 - **2026-10-14**: Completed Milestone 5 (Production Readiness & Release). Implemented ProfileHotPathsService with real-time hot path detection, wired performance-profiler middleware, enhanced production-verification.js with CI gates (cache hit rate >85%, p95 latency <500ms, throughput benchmarks). Added integration tests for profiling accuracy. All production readiness criteria verified. Project ready for release.
 - **2026-10-14**: Completed CircuitBreaker hardening with half-open state, success thresholds, and metrics export. Enhanced QueryCacheService with TTL support, LRU eviction, and comprehensive statistics. Added unit tests for CircuitBreaker (8 scenarios) and integration tests for cache TTL/LRU/metrics. All production readiness criteria verified with enhanced resilience and observability.
+- **2026-10-14**: Completed Stream Scheduling & Automation feature. Implemented StreamSchedulerService with cron-based and one-time scheduling, JSON file persistence, semaphore-based concurrency control (max concurrent recordings), lifecycle event emission for monitoring, and comprehensive integration tests using fake timers with persistence verification. Extended production readiness with automated stream scheduling capability.
