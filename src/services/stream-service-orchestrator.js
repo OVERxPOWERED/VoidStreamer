@@ -3,6 +3,7 @@ import StreamHealthMonitorService from './stream-health-monitor-service.js';
 import QueryCacheService from './query-cache-service.js';
 import StreamQualityService from './stream-quality-service.js';
 import StreamRecordingService from './stream-recording-service.js';
+import StreamSchedulerService from './stream-scheduler-service.js';
 
 class StreamServiceOrchestrator {
   #scraperService;
@@ -10,7 +11,9 @@ class StreamServiceOrchestrator {
   #cacheService;
   #qualityService;
   #recordingService;
+  #schedulerService;
   #metrics;
+  #eventHandlers;
 
   constructor(options = {}) {
     this.#scraperService = options.scraperService ?? new StreamScraperService();
@@ -18,6 +21,14 @@ class StreamServiceOrchestrator {
     this.#cacheService = options.cacheService ?? new QueryCacheService();
     this.#qualityService = options.qualityService ?? new StreamQualityService();
     this.#recordingService = options.recordingService ?? new StreamRecordingService();
+    
+    const schedulerConfig = options.schedulerConfig ?? {
+      maxConcurrentRecordings: 3,
+      defaultRetryAttempts: 3,
+      defaultRetryDelay: 5000,
+      timezone: 'UTC'
+    };
+    this.#schedulerService = new StreamSchedulerService(this.#recordingService, schedulerConfig);
     
     this.#metrics = {
       cacheHits: 0,
@@ -27,8 +38,76 @@ class StreamServiceOrchestrator {
       retries: 0,
       totalRequests: 0,
       qualityRequests: 0,
-      recordingRequests: 0
+      recordingRequests: 0,
+      schedulerEvents: { triggered: 0, completed: 0, failed: 0 }
     };
+    
+    this.#eventHandlers = new Map();
+    this.#setupSchedulerEventForwarding();
+  }
+
+  #setupSchedulerEventForwarding() {
+    this.#schedulerService.on('schedule:triggered', (schedule) => {
+      this.#metrics.schedulerEvents.triggered++;
+      this.#emit('scheduler:schedule:triggered', schedule);
+    });
+    
+    this.#schedulerService.on('schedule:completed', (result) => {
+      this.#metrics.schedulerEvents.completed++;
+      this.#emit('scheduler:schedule:completed', result);
+    });
+    
+    this.#schedulerService.on('schedule:failed', (error) => {
+      this.#metrics.schedulerEvents.failed++;
+      this.#emit('scheduler:schedule:failed', error);
+    });
+    
+    this.#schedulerService.on('schedule:added', (schedule) => {
+      this.#emit('scheduler:schedule:added', schedule);
+    });
+    
+    this.#schedulerService.on('schedule:removed', (scheduleId) => {
+      this.#emit('scheduler:schedule:removed', scheduleId);
+    });
+  }
+
+  #emit(event, data) {
+    const handlers = this.#eventHandlers.get(event) || [];
+    for (const handler of handlers) {
+      try {
+        handler(data);
+      } catch (error) {
+        console.error(`Error in event handler for ${event}:`, error);
+      }
+    }
+  }
+
+  on(event, handler) {
+    if (!this.#eventHandlers.has(event)) {
+      this.#eventHandlers.set(event, []);
+    }
+    this.#eventHandlers.get(event).push(handler);
+    return () => this.off(event, handler);
+  }
+
+  off(event, handler) {
+    const handlers = this.#eventHandlers.get(event) || [];
+    const index = handlers.indexOf(handler);
+    if (index !== -1) {
+      handlers.splice(index, 1);
+    }
+  }
+
+  #generateCacheKey(url) {
+    return `stream:${url}`;
+  }
+
+  #generateQualityCacheKey(url) {
+    return `quality:${url}`;
+  }
+
+  #sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   async getStreamData(url, options = {}) {
@@ -125,7 +204,7 @@ class StreamServiceOrchestrator {
         lastError = error;
         
         if (attempt < maxRetries) {
-          const delay = Math.min(500 * Math.pow(2, attempt - 1), 5000);
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
           await this.#sleep(delay);
         }
       }
@@ -134,125 +213,81 @@ class StreamServiceOrchestrator {
     throw lastError;
   }
 
-  async selectQuality(streamUrl, qualityId, options = {}) {
-    const { validateAvailability = true } = options;
-    
-    if (validateAvailability) {
-      const { qualities } = await this.getStreamQualities(streamUrl);
-      const quality = qualities.find(q => q.id === qualityId);
-      if (!quality) {
-        throw new Error(`Quality ${qualityId} not available for stream`);
-      }
-      if (!quality.available) {
-        throw new Error(`Quality ${qualityId} is currently unavailable`);
-      }
-    }
-
-    const selectedUrl = await this.#qualityService.selectQuality(streamUrl, qualityId);
-    
-    return {
-      streamUrl: selectedUrl,
-      qualityId,
-      selectedAt: new Date().toISOString()
-    };
-  }
-
   async startRecording(streamUrl, options = {}) {
-    const { 
-      qualityId, 
-      duration, 
-      outputFormat = 'mp4',
-      outputPath,
-      segmentDuration = 10 
-    } = options;
-    
     this.#metrics.recordingRequests++;
-
-    let recordingUrl = streamUrl;
-    if (qualityId) {
-      const selection = await this.selectQuality(streamUrl, qualityId);
-      recordingUrl = selection.streamUrl;
-    }
-
-    const recording = await this.#recordingService.startRecording(recordingUrl, {
-      outputFormat,
-      outputPath,
-      duration,
-      segmentDuration
-    });
-
-    return {
-      recordingId: recording.id,
-      streamUrl: recordingUrl,
-      qualityId,
-      status: 'recording',
-      startedAt: recording.startedAt,
-      options: { outputFormat, duration, segmentDuration }
-    };
+    return this.#recordingService.startRecording(streamUrl, options);
   }
 
   async stopRecording(recordingId) {
-    const result = await this.#recordingService.stopRecording(recordingId);
-    
+    return this.#recordingService.stopRecording(recordingId);
+  }
+
+  getRecordingStatus(recordingId) {
+    return this.#recordingService.getRecordingStatus(recordingId);
+  }
+
+  listRecordings() {
+    return this.#recordingService.listRecordings();
+  }
+
+  addRecordingSchedule(scheduleConfig) {
+    return this.#schedulerService.addSchedule(scheduleConfig);
+  }
+
+  removeRecordingSchedule(scheduleId) {
+    return this.#schedulerService.removeSchedule(scheduleId);
+  }
+
+  listRecordingSchedules() {
+    return this.#schedulerService.listSchedules();
+  }
+
+  getSchedule(scheduleId) {
+    return this.#schedulerService.getSchedule(scheduleId);
+  }
+
+  enableSchedule(scheduleId) {
+    return this.#schedulerService.enableSchedule(scheduleId);
+  }
+
+  disableSchedule(scheduleId) {
+    return this.#schedulerService.disableSchedule(scheduleId);
+  }
+
+  triggerSchedule(scheduleId) {
+    return this.#schedulerService.triggerSchedule(scheduleId);
+  }
+
+  getSchedulerStats() {
+    return this.#schedulerService.getStats();
+  }
+
+  getStatus() {
+    const schedulerStats = this.#schedulerService.getStats();
     return {
-      recordingId,
-      status: 'stopped',
-      stoppedAt: new Date().toISOString(),
-      outputPath: result.outputPath,
-      duration: result.duration,
-      fileSize: result.fileSize
+      metrics: { ...this.#metrics },
+      cache: this.#cacheService.getStats(),
+      healthMonitor: this.#healthMonitorService.getStats(),
+      qualityService: this.#qualityService.getStats(),
+      recordingService: this.#recordingService.getStats(),
+      scheduler: {
+        pending: schedulerStats.pending,
+        running: schedulerStats.running,
+        totalSchedules: schedulerStats.totalSchedules,
+        enabledSchedules: schedulerStats.enabledSchedules,
+        completedToday: schedulerStats.completedToday,
+        failedToday: schedulerStats.failedToday
+      },
+      uptime: process.uptime()
     };
   }
 
-  async getRecordingStatus(recordingId) {
-    const status = await this.#recordingService.getRecordingStatus(recordingId);
-    
-    return {
-      recordingId,
-      ...status
-    };
-  }
-
-  async invalidateCache(url) {
-    const cacheKey = this.#generateCacheKey(url);
-    const qualityCacheKey = this.#generateQualityCacheKey(url);
-    await Promise.all([
-      this.#cacheService.delete(cacheKey),
-      this.#cacheService.delete(qualityCacheKey)
-    ]);
-  }
-
-  getMetrics() {
-    const scraperMetrics = this.#scraperService.getMetrics?.() ?? {};
-    const healthMetrics = this.#healthMonitorService.getMetrics?.() ?? {};
-    const cacheMetrics = this.#cacheService.getMetrics?.() ?? {};
-    const qualityMetrics = this.#qualityService.getMetrics?.() ?? {};
-    const recordingMetrics = this.#recordingService.getMetrics?.() ?? {};
-
-    return {
-      orchestrator: { ...this.#metrics },
-      scraper: scraperMetrics,
-      healthMonitor: healthMetrics,
-      cache: cacheMetrics,
-      quality: qualityMetrics,
-      recording: recordingMetrics
-    };
-  }
-
-  #generateCacheKey(url) {
-    return `stream:${url}`;
-  }
-
-  #generateQualityCacheKey(url) {
-    return `stream:qualities:${url}`;
-  }
-
-  #sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  async shutdown() {
+    await this.#schedulerService.shutdown();
+    await this.#recordingService.shutdown();
+    await this.#cacheService.clear();
+    this.#eventHandlers.clear();
   }
 }
 
-const defaultOrchestrator = new StreamServiceOrchestrator();
-
-export { StreamServiceOrchestrator };
-export default defaultOrchestrator;
+export default StreamServiceOrchestrator;
