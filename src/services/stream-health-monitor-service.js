@@ -22,6 +22,7 @@ class StreamHealthMonitorService extends EventEmitter {
 
     this.monitoredStreams = new Map();
     this.circuitBreakers = new Map();
+    this.healthCheckMetrics = new Map();
     this.checkInterval = null;
     this.isRunning = false;
     this.queryCache = new QueryCacheService();
@@ -77,11 +78,31 @@ class StreamHealthMonitorService extends EventEmitter {
     };
 
     this.monitoredStreams.set(url, streamState);
+    this._initializeHealthMetrics(url);
     return streamState;
+  }
+
+  _initializeHealthMetrics(url) {
+    this.healthCheckMetrics.set(url, {
+      totalChecks: 0,
+      successfulChecks: 0,
+      failedChecks: 0,
+      lastCheckTime: null,
+      avgLatencyMs: 0,
+      totalLatencyMs: 0,
+      retryStats: {
+        totalRetries: 0,
+        successfulRetries: 0,
+        failedRetries: 0,
+        avgRetryAttempts: 0,
+        maxRetryAttempts: 0
+      }
+    });
   }
 
   removeStream(url) {
     this.monitoredStreams.delete(url);
+    this.healthCheckMetrics.delete(url);
     const breaker = this.circuitBreakers.get(url);
     if (breaker) {
       breaker.destroy();
@@ -116,8 +137,10 @@ class StreamHealthMonitorService extends EventEmitter {
       streamState.consecutiveFailures = 0;
       streamState.status = result.healthy ? 'healthy' : 'degraded';
 
+      this._updateHealthMetrics(url, latencyMs, true, this.streamScraper.getRetryMetrics());
       await this._cacheHealthResult(url, streamState);
       this._emitHealthChange(url, previousStatus, streamState.status, streamState);
+      this._emitHealthMetricsUpdated(url);
 
       return { ...streamState, healthy: result.healthy, details: result.details };
 
@@ -132,205 +155,181 @@ class StreamHealthMonitorService extends EventEmitter {
       streamState.consecutiveFailures++;
       streamState.status = streamState.consecutiveFailures >= 3 ? 'unhealthy' : 'degraded';
 
+      this._updateHealthMetrics(url, latencyMs, false, this.streamScraper.getRetryMetrics());
       await this._cacheHealthResult(url, streamState);
       this._emitHealthChange(url, previousStatus, streamState.status, streamState);
+      this._emitHealthMetricsUpdated(url);
 
-      return { ...streamState, healthy: false, error: error.message };
-
+      throw error;
     } finally {
       this.semaphore.release();
     }
   }
 
   async _performHealthCheck(url, options) {
-    try {
-      const response = await this.streamScraper.fetchStreamManifest(url, {
-        timeout: options.timeoutMs,
-        headers: { 'Accept': '*/*' }
-      });
+    const scrapeResult = await this.streamScraper.scrapeStream(url, {
+      timeout: options.timeoutMs,
+      validateContent: options.validateContent,
+      expectedContentType: options.expectedContentType
+    });
 
-      if (!response || response.status >= 400) {
-        return { healthy: false, details: `HTTP ${response?.status || 'No response'}` };
+    return {
+      healthy: scrapeResult.success,
+      details: {
+        statusCode: scrapeResult.statusCode,
+        contentType: scrapeResult.contentType,
+        contentLength: scrapeResult.contentLength,
+        redirectUrl: scrapeResult.redirectUrl,
+        error: scrapeResult.error
       }
+    };
+  }
 
-      const contentType = response.headers?.['content-type'] || '';
-      if (options.expectedContentType && !contentType.includes(options.expectedContentType)) {
-        return { healthy: false, details: `Unexpected content type: ${contentType}` };
-      }
+  _updateHealthMetrics(url, latencyMs, success, retryMetrics) {
+    const metrics = this.healthCheckMetrics.get(url);
+    if (!metrics) return;
 
-      if (options.validateContent) {
-        const contentValid = await this._validateStreamContent(response.data, contentType);
-        if (!contentValid) {
-          return { healthy: false, details: 'Stream content validation failed' };
-        }
-      }
+    metrics.totalChecks++;
+    metrics.lastCheckTime = new Date().toISOString();
+    metrics.totalLatencyMs += latencyMs;
+    metrics.avgLatencyMs = Math.round(metrics.totalLatencyMs / metrics.totalChecks);
 
-      return { healthy: true, details: 'OK', contentType };
+    if (success) {
+      metrics.successfulChecks++;
+    } else {
+      metrics.failedChecks++;
+    }
 
-    } catch (error) {
-      return { healthy: false, details: error.message };
+    if (retryMetrics) {
+      metrics.retryStats.totalRetries += retryMetrics.totalRetries || 0;
+      metrics.retryStats.successfulRetries += retryMetrics.successfulRetries || 0;
+      metrics.retryStats.failedRetries += retryMetrics.failedRetries || 0;
+      metrics.retryStats.avgRetryAttempts = retryMetrics.avgRetryAttempts || 0;
+      metrics.retryStats.maxRetryAttempts = Math.max(
+        metrics.retryStats.maxRetryAttempts,
+        retryMetrics.maxRetryAttempts || 0
+      );
     }
   }
 
-  async _validateStreamContent(data, contentType) {
-    if (!data) return false;
-    
-    if (contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('application/x-mpegURL')) {
-      const manifest = data.toString();
-      return manifest.includes('#EXTM3U') && (manifest.includes('#EXT-X-STREAM-INF') || manifest.includes('#EXTINF:'));
-    }
-    
-    if (contentType.includes('application/dash+xml')) {
-      const manifest = data.toString();
-      return manifest.includes('<MPD') && manifest.includes('xmlns="urn:mpeg:dash:schema:mpd:2011"');
+  _emitHealthMetricsUpdated(url) {
+    const metrics = this.getHealthMetrics(url);
+    this.emit('healthMetricsUpdated', {
+      streamUrl: url,
+      timestamp: new Date().toISOString(),
+      metrics
+    });
+  }
+
+  getHealthMetrics(streamUrl) {
+    if (streamUrl) {
+      const metrics = this.healthCheckMetrics.get(streamUrl);
+      const streamState = this.monitoredStreams.get(streamUrl);
+      if (!metrics) return null;
+
+      return {
+        streamUrl,
+        ...metrics,
+        currentStatus: streamState?.status || 'unknown',
+        lastCheck: streamState?.lastCheck || null,
+        circuitBreakerState: this.circuitBreakers.get(streamUrl)?.getState() || 'unknown'
+      };
     }
 
-    return true;
+    return this.getAllHealthMetrics();
+  }
+
+  getAllHealthMetrics() {
+    const allMetrics = {};
+    for (const [url, metrics] of this.healthCheckMetrics.entries()) {
+      const streamState = this.monitoredStreams.get(url);
+      allMetrics[url] = {
+        streamUrl: url,
+        ...metrics,
+        currentStatus: streamState?.status || 'unknown',
+        lastCheck: streamState?.lastCheck || null,
+        circuitBreakerState: this.circuitBreakers.get(url)?.getState() || 'unknown'
+      };
+    }
+    return allMetrics;
   }
 
   async _cacheHealthResult(url, streamState) {
     const cacheKey = `health:${url}`;
-    const cacheData = {
-      url: streamState.url,
-      status: streamState.status,
-      latencyMs: streamState.latencyMs,
-      lastCheck: streamState.lastCheck,
-      errorCount: streamState.errorCount,
-      consecutiveFailures: streamState.consecutiveFailures
-    };
-    
-    await this.queryCache.set(cacheKey, cacheData, { ttl: this.config.cacheTTL });
+    await this.queryCache.set(cacheKey, streamState, this.config.cacheTTL);
   }
 
   _emitHealthChange(url, previousStatus, newStatus, streamState) {
     if (previousStatus !== newStatus) {
-      this.emit('health-change', {
+      this.emit('healthChange', {
         url,
         previousStatus,
         newStatus,
         timestamp: new Date().toISOString(),
-        latencyMs: streamState.latencyMs,
-        consecutiveFailures: streamState.consecutiveFailures
+        streamState
       });
     }
+    this.emit('checkComplete', {
+      url,
+      status: newStatus,
+      timestamp: new Date().toISOString(),
+      streamState
+    });
   }
 
   async startMonitoring() {
-    if (this.isRunning) {
-      return;
-    }
-
+    if (this.isRunning) return;
+    
     this.isRunning = true;
-    
-    const runChecks = async () => {
-      if (!this.isRunning) return;
-      
-      const urls = Array.from(this.monitoredStreams.keys());
-      const checkPromises = urls.map(url => this.checkStreamHealth(url).catch(err => ({
-        url,
-        healthy: false,
-        error: err.message
-      })));
+    this.checkInterval = setInterval(async () => {
+      await this._runHealthChecks();
+    }, this.config.checkIntervalMs);
 
-      await Promise.allSettled(checkPromises);
-    };
-
-    await runChecks();
-    
-    this.checkInterval = setInterval(runChecks, this.config.checkIntervalMs);
-    this.checkInterval.unref();
+    await this._runHealthChecks();
+    this.emit('monitoringStarted');
   }
 
-  stopMonitoring() {
-    if (!this.isRunning) {
-      return;
-    }
-
-    this.isRunning = false;
+  async stopMonitoring() {
+    if (!this.isRunning) return;
     
+    this.isRunning = false;
     if (this.checkInterval) {
       clearInterval(this.checkInterval);
       this.checkInterval = null;
     }
+    this.emit('monitoringStopped');
   }
 
-  getHealthStatus(url) {
-    const streamState = this.monitoredStreams.get(url);
-    if (!streamState) {
-      return null;
-    }
+  async _runHealthChecks() {
+    const urls = Array.from(this.monitoredStreams.keys());
+    const checkPromises = urls.map(url => 
+      this.checkStreamHealth(url).catch(error => {
+        this.emit('checkError', { url, error: error.message, timestamp: new Date().toISOString() });
+      })
+    );
 
-    const circuitBreaker = this.circuitBreakers.get(url);
-    return {
-      ...streamState,
-      circuitBreakerState: circuitBreaker ? circuitBreaker.getState() : null,
-      uptimePercentage: streamState.totalChecks > 0 
-        ? ((streamState.successfulChecks / streamState.totalChecks) * 100).toFixed(2)
-        : 0
-    };
+    await Promise.allSettled(checkPromises);
   }
 
-  getHealthReport() {
-    const streams = Array.from(this.monitoredStreams.values());
-    const totalMonitored = streams.length;
-    
-    if (totalMonitored === 0) {
-      return {
-        totalMonitored: 0,
-        healthy: 0,
-        degraded: 0,
-        unhealthy: 0,
-        avgLatencyMs: 0,
-        uptimePercentage: 0
-      };
-    }
-
-    const healthy = streams.filter(s => s.status === 'healthy').length;
-    const degraded = streams.filter(s => s.status === 'degraded').length;
-    const unhealthy = streams.filter(s => s.status === 'unhealthy').length;
-    
-    const latencies = streams
-      .filter(s => s.latencyMs !== null)
-      .map(s => s.latencyMs);
-    const avgLatencyMs = latencies.length > 0
-      ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length)
-      : 0;
-
-    const totalChecks = streams.reduce((sum, s) => sum + s.totalChecks, 0);
-    const totalSuccessful = streams.reduce((sum, s) => sum + s.successfulChecks, 0);
-    const uptimePercentage = totalChecks > 0 
-      ? parseFloat(((totalSuccessful / totalChecks) * 100).toFixed(2))
-      : 0;
-
-    return {
-      totalMonitored,
-      healthy,
-      degraded,
-      unhealthy,
-      avgLatencyMs,
-      uptimePercentage,
-      timestamp: new Date().toISOString()
-    };
+  getMonitoredStreams() {
+    return Array.from(this.monitoredStreams.values());
   }
 
-  async getCachedHealth(url) {
-    const cacheKey = `health:${url}`;
-    return await this.queryCache.get(cacheKey);
+  getStreamState(url) {
+    return this.monitoredStreams.get(url) || null;
   }
 
-  destroy() {
-    this.stopMonitoring();
-    
-    for (const [url, breaker] of this.circuitBreakers) {
+  async shutdown() {
+    await this.stopMonitoring();
+    for (const [url, breaker] of this.circuitBreakers.entries()) {
       breaker.destroy();
     }
     this.circuitBreakers.clear();
     this.monitoredStreams.clear();
+    this.healthCheckMetrics.clear();
+    await this.queryCache.clear();
     this.removeAllListeners();
   }
 }
 
-const defaultInstance = new StreamHealthMonitorService();
-
 module.exports = StreamHealthMonitorService;
-module.exports.default = defaultInstance;
