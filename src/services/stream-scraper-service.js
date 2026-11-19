@@ -3,6 +3,7 @@ const cheerio = require('cheerio');
 const { StructuredLogger } = require('./structured-logging-service');
 const { TelemetryService } = require('./telemetry-service');
 const { ConfigService } = require('./config-service');
+const { RetryPolicy, defaultRetryPolicy } = require('../utils/retry-policy');
 
 class CircuitBreaker {
   constructor(options = {}) {
@@ -126,21 +127,20 @@ class StreamScraperService {
       successThreshold: options.circuitBreakerSuccessThreshold || 2
     });
 
+    this.retryPolicy = options.retryPolicy || defaultRetryPolicy;
+
     this.userAgents = this.config.get('scraper.userAgents') || [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15'
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15'
     ];
 
-    this.axiosInstance = this.createAxiosInstance();
-  }
-
-  createAxiosInstance() {
-    return axios.create({
+    this.axiosInstance = axios.create({
       timeout: this.responseTimeout,
-      connectTimeout: this.connectTimeout,
+      maxRedirects: 5,
+      validateStatus: (status) => status >= 200 && status < 400,
       headers: {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
@@ -152,240 +152,333 @@ class StreamScraperService {
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0'
-      },
-      validateStatus: (status) => status < 500,
-      maxRedirects: 5,
-      decompress: true
-    });
-  }
-
-  getRandomUserAgent() {
-    const index = Math.floor(Math.random() * this.userAgents.length);
-    return this.userAgents[index];
-  }
-
-  async scrape(url, options = {}) {
-    const startTime = Date.now();
-    const requestId = options.requestId || `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    this.logger.info('Starting scrape request', { url, requestId });
-
-    try {
-      const result = await this.circuitBreaker.execute(async () => {
-        return await this.scrapeWithRetry(url, options, requestId);
-      });
-
-      const duration = Date.now() - startTime;
-      this.telemetry.recordScrapeSuccess(url, duration);
-      this.logger.info('Scrape completed successfully', { url, requestId, duration });
-
-      return result;
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      this.telemetry.recordScrapeFailure(url, duration, error.code || 'UNKNOWN');
-      this.logger.error('Scrape failed', { url, requestId, duration, error: error.message, code: error.code });
-      throw error;
-    }
-  }
-
-  async scrapeWithRetry(url, options, requestId) {
-    let lastError;
-    
-    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      try {
-        const response = await this.makeRequest(url, options, requestId, attempt);
-        return this.parseResponse(response, url, options);
-      } catch (error) {
-        lastError = error;
-        
-        if (error.code === ERROR_CODES.CIRCUIT_OPEN) {
-          throw error;
-        }
-
-        if (attempt < this.maxRetries) {
-          const delay = this.calculateBackoff(attempt);
-          this.logger.warn('Retrying scrape', { url, requestId, attempt, delay, error: error.message });
-          await this.sleep(delay);
-        }
       }
-    }
+    });
 
-    throw new StreamScraperError(
-      `Max retries (${this.maxRetries}) exceeded for ${url}`,
-      ERROR_CODES.MAX_RETRIES_EXCEEDED,
-      { url, attempts: this.maxRetries, lastError: lastError?.message }
+    this.axiosInstance.interceptors.request.use((config) => {
+      config.headers['User-Agent'] = this.getRandomUserAgent();
+      return config;
+    });
+
+    this.axiosInstance.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+          throw new StreamScraperError('Request timeout', ERROR_CODES.TIMEOUT_ERROR, { originalError: error.message });
+        }
+        if (!error.response) {
+          throw new StreamScraperError('Network error', ERROR_CODES.NETWORK_ERROR, { originalError: error.message });
+        }
+        throw new StreamScraperError(`HTTP ${error.response.status}`, ERROR_CODES.HTTP_ERROR, { 
+          status: error.response.status,
+          statusText: error.response.statusText 
+        });
+      }
     );
   }
 
-  async makeRequest(url, options, requestId, attempt) {
-    const headers = {
-      'User-Agent': options.userAgent || this.getRandomUserAgent(),
-      ...options.headers
-    };
+  getRandomUserAgent() {
+    return this.userAgents[Math.floor(Math.random() * this.userAgents.length)];
+  }
 
-    if (options.referer) {
-      headers['Referer'] = options.referer;
-    }
-
+  async fetchStreamMetadata(url) {
+    const startTime = Date.now();
+    
     try {
-      const response = await this.axiosInstance.get(url, {
-        headers,
-        timeout: this.responseTimeout,
-        signal: options.signal
+      const result = await this.circuitBreaker.execute(async () => {
+        return await this.retryPolicy.execute(async () => {
+          const response = await this.axiosInstance.get(url, {
+            timeout: this.connectTimeout
+          });
+          return response;
+        });
       });
 
-      if (response.status >= 400) {
-        throw new StreamScraperError(
-          `HTTP ${response.status} for ${url}`,
-          ERROR_CODES.HTTP_ERROR,
-          { url, status: response.status, attempt }
-        );
-      }
-
-      if (!response.data || typeof response.data !== 'string') {
-        throw new StreamScraperError(
-          'Invalid response: empty or non-string body',
-          ERROR_CODES.INVALID_RESPONSE,
-          { url, attempt }
-        );
-      }
-
-      return response;
+      const metadata = this.parseStreamPage(result.data, url);
+      
+      this.telemetry.recordMetric('stream_scraper.duration', Date.now() - startTime, { url });
+      this.telemetry.incrementCounter('stream_scraper.success', { url });
+      
+      return metadata;
     } catch (error) {
-      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-        throw new StreamScraperError(
-          `Request timeout for ${url}`,
-          ERROR_CODES.TIMEOUT_ERROR,
-          { url, attempt, originalError: error.message }
-        );
+      this.telemetry.recordMetric('stream_scraper.duration', Date.now() - startTime, { url });
+      this.telemetry.incrementCounter('stream_scraper.error', { url, error: error.code || 'UNKNOWN' });
+      
+      if (error.message === 'Circuit breaker is OPEN') {
+        throw new StreamScraperError('Circuit breaker is open', ERROR_CODES.CIRCUIT_OPEN, { url });
       }
       
-      if (error.isAxiosError) {
-        throw new StreamScraperError(
-          `Network error for ${url}: ${error.message}`,
-          ERROR_CODES.NETWORK_ERROR,
-          { url, attempt, originalError: error.message }
-        );
+      if (error.name === 'RetryPolicyError' || error.code === 'MAX_RETRIES_EXCEEDED') {
+        throw new StreamScraperError('Max retries exceeded', ERROR_CODES.MAX_RETRIES_EXCEEDED, { url, originalError: error.message });
       }
       
       throw error;
     }
   }
 
-  parseResponse(response, url, options) {
+  parseStreamPage(html, url) {
+    if (!html || typeof html !== 'string') {
+      throw new StreamScraperError('Invalid response: empty HTML', ERROR_CODES.INVALID_RESPONSE, { url });
+    }
+
+    const $ = cheerio.load(html);
+    
+    const metadata = {
+      url,
+      title: null,
+      description: null,
+      thumbnail: null,
+      streamUrl: null,
+      isLive: false,
+      viewerCount: null,
+      category: null,
+      tags: [],
+      scrapedAt: new Date().toISOString()
+    };
+
     try {
-      const $ = cheerio.load(response.data);
-      
-      const result = {
-        url,
-        statusCode: response.status,
-        headers: response.headers,
-        html: response.data,
-        $,
-        title: $('title').text().trim(),
-        metaDescription: $('meta[name="description"]').attr('content') || '',
-        metaKeywords: $('meta[name="keywords"]').attr('content') || '',
-        canonicalUrl: $('link[rel="canonical"]').attr('href') || url,
-        links: [],
-        images: [],
-        scripts: [],
-        stylesheets: []
-      };
-
-      $('a[href]').each((i, el) => {
-        const href = $(el).attr('href');
-        if (href) {
-          result.links.push({
-            url: this.resolveUrl(url, href),
-            text: $(el).text().trim(),
-            title: $(el).attr('title') || ''
-          });
-        }
+      metadata.title = this.extractTitle($);
+      metadata.description = this.extractDescription($);
+      metadata.thumbnail = this.extractThumbnail($);
+      metadata.streamUrl = this.extractStreamUrl($, url);
+      metadata.isLive = this.extractIsLive($);
+      metadata.viewerCount = this.extractViewerCount($);
+      metadata.category = this.extractCategory($);
+      metadata.tags = this.extractTags($);
+    } catch (parseError) {
+      this.logger.warn('Partial parsing failure', { url, error: parseError.message });
+      throw new StreamScraperError('Failed to parse stream page', ERROR_CODES.PARSING_ERROR, { 
+        url, 
+        originalError: parseError.message 
       });
+    }
 
-      $('img[src]').each((i, el) => {
-        const src = $(el).attr('src');
-        if (src) {
-          result.images.push({
-            url: this.resolveUrl(url, src),
-            alt: $(el).attr('alt') || '',
-            title: $(el).attr('title') || ''
-          });
-        }
-      });
+    return metadata;
+  }
 
-      $('script[src]').each((i, el) => {
-        const src = $(el).attr('src');
-        if (src) {
-          result.scripts.push(this.resolveUrl(url, src));
-        }
-      });
+  extractTitle($) {
+    const selectors = [
+      'meta[property="og:title"]',
+      'meta[name="twitter:title"]',
+      'h1.title',
+      'h1.stream-title',
+      '.stream-title',
+      'title'
+    ];
 
-      $('link[rel="stylesheet"]').each((i, el) => {
-        const href = $(el).attr('href');
-        if (href) {
-          result.stylesheets.push(this.resolveUrl(url, href));
-        }
-      });
-
-      if (options.customSelectors) {
-        result.custom = {};
-        for (const [key, selector] of Object.entries(options.customSelectors)) {
-          result.custom[key] = [];
-          $(selector).each((i, el) => {
-            result.custom[key].push({
-              html: $.html(el),
-              text: $(el).text().trim(),
-              attributes: el.attribs
-            });
-          });
+    for (const selector of selectors) {
+      const element = $(selector).first();
+      if (element.length) {
+        const content = element.attr('content') || element.text();
+        if (content && content.trim()) {
+          return content.trim();
         }
       }
-
-      return result;
-    } catch (error) {
-      throw new StreamScraperError(
-        `Failed to parse response from ${url}: ${error.message}`,
-        ERROR_CODES.PARSING_ERROR,
-        { url, originalError: error.message }
-      );
     }
+    return null;
   }
 
-  resolveUrl(baseUrl, relativeUrl) {
-    try {
-      return new URL(relativeUrl, baseUrl).href;
-    } catch {
-      return relativeUrl;
+  extractDescription($) {
+    const selectors = [
+      'meta[property="og:description"]',
+      'meta[name="twitter:description"]',
+      'meta[name="description"]',
+      '.stream-description',
+      '.description'
+    ];
+
+    for (const selector of selectors) {
+      const element = $(selector).first();
+      if (element.length) {
+        const content = element.attr('content') || element.text();
+        if (content && content.trim()) {
+          return content.trim();
+        }
+      }
     }
+    return null;
   }
 
-  calculateBackoff(attempt) {
-    const delay = this.baseDelay * Math.pow(2, attempt - 1);
-    const jitter = Math.random() * 0.3 * delay;
-    return Math.min(delay + jitter, 30000);
+  extractThumbnail($) {
+    const selectors = [
+      'meta[property="og:image"]',
+      'meta[name="twitter:image"]',
+      '.stream-thumbnail img',
+      '.thumbnail img',
+      'img.stream-preview'
+    ];
+
+    for (const selector of selectors) {
+      const element = $(selector).first();
+      if (element.length) {
+        const content = element.attr('content') || element.attr('src') || element.attr('data-src');
+        if (content && content.trim()) {
+          return content.trim();
+        }
+      }
+    }
+    return null;
   }
 
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  extractStreamUrl($, baseUrl) {
+    const selectors = [
+      'meta[property="og:video"]',
+      'meta[property="og:video:url"]',
+      'meta[name="twitter:player:stream"]',
+      'source[type*="video"]',
+      'video source',
+      '.stream-url',
+      '[data-stream-url]'
+    ];
+
+    for (const selector of selectors) {
+      const element = $(selector).first();
+      if (element.length) {
+        const content = element.attr('content') || element.attr('src') || element.attr('data-stream-url');
+        if (content && content.trim()) {
+          return new URL(content.trim(), baseUrl).href;
+        }
+      }
+    }
+    return null;
+  }
+
+  extractIsLive($) {
+    const liveIndicators = [
+      'meta[property="og:video:is_live"]',
+      '[data-is-live="true"]',
+      '.live-indicator',
+      '.is-live',
+      '[aria-live="polite"]'
+    ];
+
+    for (const selector of liveIndicators) {
+      const element = $(selector).first();
+      if (element.length) {
+        const value = element.attr('content') || element.attr('data-is-live') || element.text();
+        if (value && (value === 'true' || value === '1' || value.toLowerCase().includes('live'))) {
+          return true;
+        }
+      }
+    }
+
+    const pageText = $('body').text().toLowerCase();
+    return pageText.includes('live now') || pageText.includes('currently live') || pageText.includes('streaming live');
+  }
+
+  extractViewerCount($) {
+    const selectors = [
+      '[data-viewer-count]',
+      '.viewer-count',
+      '.viewers',
+      '[aria-label*="viewer"]',
+      '[aria-label*="watching"]'
+    ];
+
+    for (const selector of selectors) {
+      const element = $(selector).first();
+      if (element.length) {
+        const text = element.attr('data-viewer-count') || element.attr('aria-label') || element.text();
+        const match = text.match(/[\d,]+/);
+        if (match) {
+          return parseInt(match[0].replace(/,/g, ''), 10);
+        }
+      }
+    }
+    return null;
+  }
+
+  extractCategory($) {
+    const selectors = [
+      'meta[property="og:video:tag"]',
+      'meta[name="twitter:label1"]',
+      '.stream-category',
+      '.category',
+      '[data-category]'
+    ];
+
+    for (const selector of selectors) {
+      const element = $(selector).first();
+      if (element.length) {
+        const content = element.attr('content') || element.attr('data-category') || element.text();
+        if (content && content.trim()) {
+          return content.trim();
+        }
+      }
+    }
+    return null;
+  }
+
+  extractTags($) {
+    const tags = [];
+    const selectors = [
+      'meta[property="og:video:tag"]',
+      'meta[name="keywords"]',
+      '.tags a',
+      '.tag',
+      '[data-tag]'
+    ];
+
+    for (const selector of selectors) {
+      const elements = $(selector);
+      elements.each((_, el) => {
+        const content = $(el).attr('content') || $(el).attr('data-tag') || $(el).text();
+        if (content && content.trim()) {
+          const splitTags = content.split(',').map(t => t.trim()).filter(t => t);
+          tags.push(...splitTags);
+        }
+      });
+    }
+
+    return [...new Set(tags)];
+  }
+
+  async scrapeStream(url) {
+    return this.fetchStreamMetadata(url);
   }
 
   getCircuitBreakerMetrics() {
     return this.circuitBreaker.getMetrics();
   }
 
-  resetCircuitBreaker() {
-    this.circuitBreaker.reset();
+  getRetryMetrics() {
+    return this.retryPolicy.getMetrics();
   }
 
-  getCircuitBreakerState() {
-    return this.circuitBreaker.getState();
+  getCombinedMetrics() {
+    return {
+      circuitBreaker: this.getCircuitBreakerMetrics(),
+      retryPolicy: this.getRetryMetrics(),
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  resetCircuitBreaker() {
+    this.circuitBreaker.reset();
+    this.logger.info('Circuit breaker manually reset');
+  }
+
+  resetRetryPolicy() {
+    this.retryPolicy.reset();
+    this.logger.info('Retry policy manually reset');
+  }
+
+  async healthCheck() {
+    const cbState = this.circuitBreaker.getState();
+    const retryMetrics = this.retryPolicy.getMetrics();
+    
+    return {
+      healthy: cbState !== 'OPEN',
+      circuitBreakerState: cbState,
+      retryPolicyHealthy: retryMetrics.failureRate < 0.5,
+      metrics: this.getCombinedMetrics()
+    };
   }
 }
 
 module.exports = {
-  CircuitBreaker,
   StreamScraperService,
   StreamScraperError,
-  ERROR_CODES
+  ERROR_CODES,
+  CircuitBreaker
 };
