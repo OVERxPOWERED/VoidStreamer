@@ -4,6 +4,7 @@ import QueryCacheService from './query-cache-service.js';
 import StreamQualityService from './stream-quality-service.js';
 import StreamRecordingService from './stream-recording-service.js';
 import StreamSchedulerService from './stream-scheduler-service.js';
+import MetricsAggregatorService from './metrics-aggregator-service.js';
 
 class StreamServiceOrchestrator {
   #scraperService;
@@ -12,6 +13,7 @@ class StreamServiceOrchestrator {
   #qualityService;
   #recordingService;
   #schedulerService;
+  #metricsAggregator;
   #metrics;
   #eventHandlers;
   #healthMonitoringActive;
@@ -32,6 +34,13 @@ class StreamServiceOrchestrator {
     };
     this.#schedulerService = new StreamSchedulerService(this.#recordingService, schedulerConfig);
     
+    this.#metricsAggregator = new MetricsAggregatorService(
+      this.#schedulerService.circuitBreakers,
+      this.#cacheService,
+      this.#healthMonitorService,
+      this.#schedulerService
+    );
+    
     this.#metrics = {
       cacheHits: 0,
       cacheMisses: 0,
@@ -51,6 +60,7 @@ class StreamServiceOrchestrator {
     this.#setupSchedulerEventForwarding();
     this.#setupHealthMonitorEventForwarding();
     this.#setupRecordingCoordination();
+    this.#setupMetricsAggregatorEventForwarding();
   }
 
   #setupSchedulerEventForwarding() {
@@ -103,23 +113,33 @@ class StreamServiceOrchestrator {
       this.#emit('orchestrator:recording:started', recording);
     });
 
-    this.#recordingService.on('recording:stopped', (recording) => {
+    this.#recordingService.on('recording:completed', (recording) => {
       this.#recordingStreamIds.delete(recording.streamId);
       this.#healthMonitorService.resumeHealthChecks(recording.streamId);
-      this.#emit('orchestrator:recording:stopped', recording);
+      this.#emit('orchestrator:recording:completed', recording);
     });
 
     this.#recordingService.on('recording:failed', (error) => {
-      if (error.streamId) {
-        this.#recordingStreamIds.delete(error.streamId);
-        this.#healthMonitorService.resumeHealthChecks(error.streamId);
-      }
       this.#emit('orchestrator:recording:failed', error);
+    });
+
+    this.#recordingService.on('recording:progress', (progress) => {
+      this.#emit('orchestrator:recording:progress', progress);
+    });
+  }
+
+  #setupMetricsAggregatorEventForwarding() {
+    this.#metricsAggregator.on('metricsCollected', (snapshot) => {
+      this.#emit('orchestrator:metricsCollected', snapshot);
+    });
+
+    this.#metricsAggregator.on('collectionError', (error) => {
+      this.#emit('orchestrator:metricsCollectionError', error);
     });
   }
 
   #emit(event, data) {
-    const handlers = this.#eventHandlers.get(event) || [];
+    const handlers = this.#eventHandlers.get(event) ?? [];
     for (const handler of handlers) {
       try {
         handler(data);
@@ -134,99 +154,103 @@ class StreamServiceOrchestrator {
       this.#eventHandlers.set(event, []);
     }
     this.#eventHandlers.get(event).push(handler);
-    return () => this.off(event, handler);
   }
 
   off(event, handler) {
-    const handlers = this.#eventHandlers.get(event) || [];
-    const index = handlers.indexOf(handler);
-    if (index !== -1) {
-      handlers.splice(index, 1);
+    const handlers = this.#eventHandlers.get(event);
+    if (handlers) {
+      const index = handlers.indexOf(handler);
+      if (index !== -1) {
+        handlers.splice(index, 1);
+      }
     }
   }
 
-  #generateCacheKey(url) {
-    return `stream:${url}`;
+  async initialize() {
+    await this.#healthMonitorService.initialize();
+    await this.#schedulerService.initialize();
+    this.#metricsAggregator.startCollection(30000);
+    this.#healthMonitoringActive = true;
   }
 
-  #generateQualityCacheKey(url) {
-    return `quality:${url}`;
+  async shutdown() {
+    this.#metricsAggregator.stopCollection();
+    await this.#schedulerService.shutdown();
+    await this.#healthMonitorService.shutdown();
+    await this.#recordingService.stopAllRecordings();
+    this.#healthMonitoringActive = false;
+    this.#eventHandlers.clear();
   }
 
-  #sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  getHealthMetrics() {
+    const aggregatorSnapshot = this.#metricsAggregator.getMetricsSnapshot();
+    return {
+      orchestrator: { ...this.#metrics },
+      aggregated: aggregatorSnapshot,
+      timestamp: new Date().toISOString()
+    };
   }
 
-  async getStreamData(url, options = {}) {
-    const { 
-      ttl = 300000, 
-      maxRetries = 3, 
-      skipHealthCheck = false,
-      includeQualities = false 
-    } = options;
+  getMetricsAggregator() {
+    return this.#metricsAggregator;
+  }
+
+  // Scraper service delegation
+  async scrapeStream(url, options = {}) {
     this.#metrics.totalRequests++;
-
-    const cacheKey = this.#generateCacheKey(url);
-    
-    const cached = await this.#cacheService.get(cacheKey);
-    if (cached !== null) {
-      this.#metrics.cacheHits++;
-      const result = { data: cached, source: 'cache', cached: true };
-      if (includeQualities) {
-        result.qualities = await this.getStreamQualities(url, { ttl });
-      }
+    try {
+      const result = await this.#scraperService.scrape(url, options);
+      this.#metrics.scrapes.success++;
       return result;
+    } catch (error) {
+      this.#metrics.scrapes.failure++;
+      throw error;
     }
-
-    this.#metrics.cacheMisses++;
-    
-    let lastError;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        const data = await this.#scraperService.scrapeStream(url);
-        this.#metrics.scrapes.success++;
-        
-        await this.#cacheService.set(cacheKey, data, ttl);
-        
-        if (!skipHealthCheck) {
-          await this.#healthMonitorService.checkStreamHealth(url);
-        }
-        
-        const result = { data, source: 'scraper', cached: false };
-        if (includeQualities) {
-          result.qualities = await this.getStreamQualities(url, { ttl });
-        }
-        return result;
-      } catch (error) {
-        lastError = error;
-        this.#metrics.scrapes.failure++;
-        this.#metrics.retries++;
-        
-        if (attempt < maxRetries) {
-          const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
-          await this.#sleep(delay);
-        }
-      }
-    }
-    
-    throw lastError;
   }
 
-  async getStreamQualities(url, options = {}) {
-    const { ttl = 300000 } = options;
+  // Cache service delegation
+  async getCached(key) {
+    const result = await this.#cacheService.get(key);
+    if (result !== undefined) {
+      this.#metrics.cacheHits++;
+    } else {
+      this.#metrics.cacheMisses++;
+    }
+    return result;
+  }
+
+  async setCache(key, value, ttl) {
+    return this.#cacheService.set(key, value, ttl);
+  }
+
+  async invalidateCache(pattern) {
+    return this.#cacheService.invalidate(pattern);
+  }
+
+  getCacheStats() {
+    return this.#cacheService.getStats();
+  }
+
+  // Health monitor delegation
+  async checkStreamHealth(streamId) {
+    return this.#healthMonitorService.checkHealth(streamId);
+  }
+
+  async checkMultipleStreamHealth(streamIds) {
+    return this.#healthMonitorService.checkMultipleHealth(streamIds);
+  }
+
+  getHealthMonitorMetrics() {
+    return this.#healthMonitorService.getMetrics();
+  }
+
+  // Quality service delegation
+  async getStreamQuality(streamId, options = {}) {
     this.#metrics.qualityRequests++;
-    
-    const cacheKey = this.#generateQualityCacheKey(url);
-    const cached = await this.#cacheService.get(cacheKey);
-    if (cached !== null) {
-      return cached;
-    }
-    
-    const qualities = await this.#qualityService.getQualities(url);
-    await this.#cacheService.set(cacheKey, qualities, ttl);
-    return qualities;
+    return this.#qualityService.getQuality(streamId, options);
   }
 
+  // Recording service delegation
   async startRecording(streamId, options = {}) {
     this.#metrics.recordingRequests++;
     return this.#recordingService.startRecording(streamId, options);
@@ -237,13 +261,14 @@ class StreamServiceOrchestrator {
   }
 
   getRecordingStatus(recordingId) {
-    return this.#recordingService.getRecordingStatus(recordingId);
+    return this.#recordingService.getStatus(recordingId);
   }
 
-  listRecordings() {
-    return this.#recordingService.listRecordings();
+  getActiveRecordings() {
+    return this.#recordingService.getActiveRecordings();
   }
 
+  // Scheduler service delegation
   addSchedule(schedule) {
     return this.#schedulerService.addSchedule(schedule);
   }
@@ -256,56 +281,38 @@ class StreamServiceOrchestrator {
     return this.#schedulerService.getSchedule(scheduleId);
   }
 
-  listSchedules() {
-    return this.#schedulerService.listSchedules();
+  getAllSchedules() {
+    return this.#schedulerService.getAllSchedules();
   }
 
-  getHealthMetrics() {
-    return this.#healthMonitorService.getAllHealthMetrics();
+  getSchedulerStats() {
+    return this.#schedulerService.getStats();
   }
 
-  getStreamHealth(streamId) {
-    return this.#healthMonitorService.getHealthMetrics(streamId);
-  }
-
-  startHealthMonitoring() {
-    if (this.#healthMonitoringActive) {
-      return;
+  // Circuit breaker access
+  getCircuitBreakerStates() {
+    const states = {};
+    for (const [key, breaker] of this.#schedulerService.circuitBreakers) {
+      states[key] = breaker.getState();
     }
-    this.#healthMonitoringActive = true;
-    this.#healthMonitorService.startMonitoring();
-    this.#emit('orchestrator:healthMonitoring:started', {});
+    return states;
   }
 
-  stopHealthMonitoring() {
-    if (!this.#healthMonitoringActive) {
-      return;
+  resetCircuitBreaker(key) {
+    const breaker = this.#schedulerService.circuitBreakers.get(key);
+    if (breaker) {
+      breaker.reset();
+      return true;
     }
-    this.#healthMonitoringActive = false;
-    this.#healthMonitorService.stopMonitoring();
-    this.#emit('orchestrator:healthMonitoring:stopped', {});
+    return false;
   }
 
   isHealthMonitoringActive() {
     return this.#healthMonitoringActive;
   }
 
-  getMetrics() {
-    return {
-      ...this.#metrics,
-      healthMonitoringActive: this.#healthMonitoringActive,
-      recordingStreamCount: this.#recordingStreamIds.size,
-      cacheStats: this.#cacheService.getStats()
-    };
-  }
-
-  async shutdown() {
-    this.stopHealthMonitoring();
-    await this.#schedulerService.shutdown();
-    await this.#recordingService.stopAllRecordings();
-    this.#cacheService.clear();
-    this.#eventHandlers.clear();
-    this.#emit('orchestrator:shutdown', {});
+  getActiveRecordingStreamIds() {
+    return Array.from(this.#recordingStreamIds);
   }
 }
 
